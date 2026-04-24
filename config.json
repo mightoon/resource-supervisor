@@ -2,7 +2,10 @@
   "proxmox": {
     "host": "192.168.100.160",
     "user": "root@pam",
-    "password": "xxxx",
+    "password": "xxxxxx",
     "verify_ssl": false
+  },
+  "deepseek": {
+    "api_key_base64": "c2stNxxxxxxxxxxxxxxxxx"
   }
 }

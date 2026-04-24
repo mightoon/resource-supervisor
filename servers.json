@@ -46,22 +46,6 @@
       "proxmox_vmid": 112
     },
     {
-      "id": 6,
-      "hostname": "ymd",
-      "type": "virtual",
-      "purpose": "个人开发虚机",
-      "purpose_detail": "",
-      "ip": "192.168.100.244",
-      "cpu": "4",
-      "mem": "16GB",
-      "disk": "500TB",
-      "gpu_count": 0,
-      "assigned_gpus": [],
-      "user": "杨茗迪",
-      "parent_host": "cdta",
-      "proxmox_vmid": 110
-    },
-    {
       "id": 10,
       "hostname": "test-manu",
       "type": "physical",
@@ -119,25 +103,6 @@
       "proxmox_vmid": 105
     },
     {
-      "id": 14,
-      "hostname": "fzj",
-      "type": "virtual",
-      "purpose": "个人开发虚机",
-      "purpose_detail": "",
-      "ip": "192.168.100.243",
-      "cpu": "4",
-      "mem": "16GB",
-      "disk": "500GB",
-      "gpu_count": 1,
-      "assigned_gpus": [
-        8
-      ],
-      "user": "范振军",
-      "reg_type": "manual",
-      "parent_host": "cdta",
-      "proxmox_vmid": 107
-    },
-    {
       "id": 15,
       "hostname": "qingguanwen",
       "type": "virtual",
@@ -184,7 +149,7 @@
       "gpu_count": 4,
       "assigned_gpus": [],
       "user": "童铭",
-      "reg_type": "auto"
+      "reg_type": "manual"
     },
     {
       "id": 18,
@@ -219,6 +184,62 @@
       "assigned_gpus": [],
       "user": "管理员",
       "reg_type": "manual"
+    },
+    {
+      "id": 21,
+      "hostname": "testssh3",
+      "type": "virtual",
+      "purpose": "个人开发虚机",
+      "purpose_detail": "",
+      "ip": "192.168.100.244",
+      "cpu": "4",
+      "mem": "23GB",
+      "disk": "33GB",
+      "gpu_count": 0,
+      "assigned_gpus": [],
+      "user": "兰家龙",
+      "reg_type": "manual",
+      "ssh_verified": false,
+      "parent_host": "test-manu"
+    },
+    {
+      "id": 22,
+      "hostname": "fzj",
+      "type": "virtual",
+      "purpose": "个人开发虚机",
+      "purpose_detail": "",
+      "ip": "192.168.100.243",
+      "cpu": "4",
+      "mem": "16GB",
+      "disk": "500GB",
+      "gpu_count": 1,
+      "assigned_gpus": [
+        8
+      ],
+      "user": "范振军",
+      "reg_type": "auto",
+      "ssh_verified": true,
+      "parent_host": "cdta",
+      "proxmox_vmid": 107
+    },
+    {
+      "id": 23,
+      "hostname": "testssh2",
+      "type": "virtual",
+      "purpose": "个人开发虚机",
+      "purpose_detail": "",
+      "ip": "192.168.100.244",
+      "cpu": "4",
+      "mem": "16GB",
+      "disk": "500GB",
+      "gpu_count": 0,
+      "assigned_gpus": [],
+      "user": "杨茗迪",
+      "reg_type": "manual",
+      "ssh_verified": true,
+      "ssh_user": "cdta",
+      "ssh_password": "cdta@123",
+      "parent_host": "test-manu"
     }
   ]
 }

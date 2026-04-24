@@ -4,6 +4,8 @@ import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import uuid
 import re
+import base64
+import http.client
 
 # 加载配置文件
 def load_config():
@@ -32,6 +34,17 @@ PROXMOX_USER = PROXMOX_CONFIG.get('user', 'root@pam')
 PROXMOX_PASSWORD = PROXMOX_CONFIG.get('password', 'xxxx')
 PROXMOX_VERIFY_SSL = PROXMOX_CONFIG.get('verify_ssl', False)
 
+# DeepSeek API 配置
+DEEPSEEK_API_KEY = None
+try:
+    deepseek_config = CONFIG.get('deepseek', {})
+    api_key_base64 = deepseek_config.get('api_key_base64', '')
+    if api_key_base64:
+        DEEPSEEK_API_KEY = base64.b64decode(api_key_base64).decode('utf-8').strip()
+        print(f"DeepSeek API key 已加载，长度: {len(DEEPSEEK_API_KEY)}")
+except Exception as e:
+    print(f"警告: 无法解码 DeepSeek API key: {e}")
+
 # 尝试导入 proxmoxer，如果失败则给出提示
 try:
     from proxmoxer import ProxmoxAPI
@@ -44,6 +57,146 @@ except ImportError:
 DATA_FILE = 'servers.json'
 USERS_FILE = 'users.json'
 sessions = {}
+
+# 缓存SSH服务器的diskstats历史数据，用于计算IO速率
+# 格式: {ip: {'read_sectors': int, 'write_sectors': int, 'timestamp': float}}
+diskstats_cache = {}
+
+def deepseek_chat_stream(messages):
+    """调用 DeepSeek API 进行流式对话
+    
+    Args:
+        messages: 消息列表，格式 [{"role": "system"/"user"/"assistant", "content": "..."}]
+    
+    Yields:
+        流式返回的文本片段
+    """
+    if not DEEPSEEK_API_KEY:
+        yield "[错误: DeepSeek API key 未配置]"
+        return
+    
+    try:
+        import ssl
+        import urllib.request
+        
+        url = "https://api.deepseek.com/chat/completions"
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "stream": True,
+            "temperature": 0.7,
+            "max_tokens": 2048
+        }
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+        }
+        
+        data = json.dumps(payload).encode('utf-8')
+        
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers=headers,
+            method='POST'
+        )
+        
+        # 创建SSL上下文（允许默认证书）
+        ssl_context = ssl.create_default_context()
+        
+        with urllib.request.urlopen(req, context=ssl_context, timeout=60) as response:
+            for line in response:
+                line = line.decode('utf-8').strip()
+                if line.startswith('data: '):
+                    data_str = line[6:]  # 去掉 "data: " 前缀
+                    if data_str == '[DONE]':
+                        break
+                    try:
+                        chunk = json.loads(data_str)
+                        delta = chunk.get('choices', [{}])[0].get('delta', {})
+                        content = delta.get('content', '')
+                        if content:
+                            yield content
+                    except json.JSONDecodeError:
+                        continue
+                    except Exception:
+                        continue
+                        
+    except Exception as e:
+        yield f"[DeepSeek API 调用错误: {str(e)}]"
+
+def build_diagnosis_prompt(perf_data, logs, server_info):
+    """构建诊断提示词 - 深入分析日志中的错误和异常"""
+    
+    # 格式化性能数据（仅作参考）
+    cpu = perf_data.get('cpu', 'N/A')
+    mem = perf_data.get('mem', 'N/A')
+    disk_io = perf_data.get('disk_io', 'N/A')
+    load = perf_data.get('load', 'N/A')
+    
+    perf_summary = f"""CPU: {cpu}%, 内存: {mem}%, 磁盘IO: {disk_io} MB/s, 负载: {load}"""
+    
+    # 截断日志
+    logs_preview = logs[:12000] if logs else "无法获取日志"
+    if len(logs) > 12000:
+        logs_preview += "\n... [日志已截断]"
+    
+    prompt = f"""你是一位专业的服务器运维专家。请深入分析以下系统日志，**重点关注错误、异常和警告**。
+
+## 服务器信息
+- 主机名: {server_info.get('hostname', 'Unknown')}
+- IP地址: {server_info.get('ip', 'Unknown')}
+
+## 性能指标（参考）
+{perf_summary}
+
+## 系统日志
+```
+{logs_preview}
+```
+
+## 分析要求
+
+### 1. 问题识别
+扫描日志，找出以下类型的问题：
+- **错误 (ERROR/FATAL/CRITICAL)** - 系统/应用错误
+- **警告 (WARNING)** - 潜在风险警告
+- **服务异常** - 启动失败、崩溃、频繁重启
+- **资源问题** - OOM、磁盘满、连接超时
+- **安全问题** - 登录失败、权限错误、入侵尝试
+
+### 2. 深度分析（针对每个发现的问题）
+对于每个发现的问题，请按以下格式分析：
+
+**问题X: [问题标题]**
+- 现象: [具体发生了什么，影响范围]
+- 原因: [为什么会发生，技术原因]
+- 严重度: [高/中/低]
+- 解决: [精炼的解决措施，用1-2句话描述，不要分点列举]
+- 预防: [一句话概括如何避免再次发生]
+
+注意：每个问题分析直接给出结论，不要有过渡性描述。
+
+### 3. 整体总结（所有问题分析完后）
+最后给出整体评估：
+- 系统健康状态: [良好/一般/差]
+- 优先处理: [列出需要优先处理的问题]
+- 维护建议: [长期维护建议]
+
+### 输出格式要求
+- 使用 ## 作为一级标题、### 作为二级标题
+- 每个问题使用 **粗体** 标记问题类型和关键信息
+- 使用 - 标记列表项
+- 如有命令或代码，使用 ``` 代码块
+
+**注意**：
+- 不要描述正常运行的情况
+- 如果确实没有问题，直接回复"日志分析未发现问题，系统运行正常"
+- 分析问题要深入具体，不要泛泛而谈"""
+
+    return prompt
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -132,6 +285,346 @@ def get_physical_server_by_hostname(hostname):
         if s['type'] == 'physical' and s['hostname'] == hostname:
             return s
     return None
+
+def verify_ssh_connection(ip, username, password, timeout=5):
+    """验证SSH连接是否可用"""
+    try:
+        import socket
+        # 首先尝试TCP连接到22端口
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((ip, 22))
+        sock.close()
+        if result != 0:
+            return False, f"无法连接到 {ip}:22，请检查IP地址和网络连通性"
+        
+        # 尝试导入paramiko进行SSH验证
+        try:
+            import paramiko
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(ip, port=22, username=username, password=password, timeout=timeout)
+            # 执行简单命令验证
+            stdin, stdout, stderr = client.exec_command('echo "SSH连接测试成功"')
+            output = stdout.read().decode().strip()
+            client.close()
+            if "SSH连接测试成功" in output:
+                return True, None
+            else:
+                return False, "SSH连接验证失败，无法执行远程命令"
+        except ImportError:
+            # 如果没有paramiko，只检查端口连通性
+            return True, None
+        except paramiko.AuthenticationException:
+            return False, "SSH认证失败，请检查用户名和密码"
+        except Exception as e:
+            return False, f"SSH连接错误: {str(e)}"
+    except Exception as e:
+        return False, f"连接测试失败: {str(e)}"
+
+def get_ssh_performance(ip, username, password, timeout=10):
+    """通过SSH获取服务器性能数据"""
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(ip, port=22, username=username, password=password, timeout=timeout)
+        
+        # 批量获取性能数据的脚本
+        script = '''
+# 初始化默认值
+CPU_USAGE=0
+MEM_TOTAL=0
+MEM_USED=0
+MEM_USAGE=0
+DISK_IO=0
+READ_MB=0
+WRITE_MB=0
+LOAD_AVG=0
+
+# CPU使用率（计算1秒间隔）
+CPU_IDLE1=$(cat /proc/stat | grep "^cpu " | awk '{print $5}')
+CPU_TOTAL1=$(cat /proc/stat | grep "^cpu " | awk '{sum=$2+$3+$4+$5+$6+$7+$8} END {print sum}')
+sleep 1
+CPU_IDLE2=$(cat /proc/stat | grep "^cpu " | awk '{print $5}')
+CPU_TOTAL2=$(cat /proc/stat | grep "^cpu " | awk '{sum=$2+$3+$4+$5+$6+$7+$8} END {print sum}')
+
+if [ -n "$CPU_TOTAL1" ] && [ -n "$CPU_TOTAL2" ] && [ "$CPU_TOTAL1" != "$CPU_TOTAL2" ]; then
+    CPU_USAGE=$(echo "scale=2; 100 * (1 - ($CPU_IDLE2 - $CPU_IDLE1) / ($CPU_TOTAL2 - $CPU_TOTAL1))" | bc 2>/dev/null || echo 0)
+fi
+
+# 内存信息 (单位KB，转换为GB)
+MEM_TOTAL_KB=$(cat /proc/meminfo | grep MemTotal | awk '{print $2}')
+MEM_AVAILABLE_KB=$(cat /proc/meminfo | grep MemAvailable | awk '{print $2}')
+if [ -n "$MEM_TOTAL_KB" ] && [ -n "$MEM_AVAILABLE_KB" ]; then
+    MEM_USED_KB=$((MEM_TOTAL_KB - MEM_AVAILABLE_KB))
+    MEM_USAGE=$(echo "scale=2; 100 * $MEM_USED_KB / $MEM_TOTAL_KB" | bc 2>/dev/null || echo 0)
+    # 转换为GB
+    MEM_TOTAL=$(echo "scale=2; $MEM_TOTAL_KB / 1024 / 1024" | bc 2>/dev/null || echo 0)
+    MEM_USED=$(echo "scale=2; $MEM_USED_KB / 1024 / 1024" | bc 2>/dev/null || echo 0)
+fi
+
+# 磁盘IO - 获取当前diskstats累计值
+# 获取主磁盘设备（通常是sda或nvme0n1）
+DISK_DEV=$(lsblk -nd -o NAME 2>/dev/null | grep -E '^(sda|nvme0n1|vda|hda)' | head -1)
+if [ -z "$DISK_DEV" ]; then
+    DISK_DEV="sda"
+fi
+
+# 读取当前磁盘统计（累计扇区数）
+DISK_STAT=$(cat /proc/diskstats | grep "$DISK_DEV" | head -1)
+READ_SECTORS=$(echo "$DISK_STAT" | awk '{print $6}')
+WRITE_SECTORS=$(echo "$DISK_STAT" | awk '{print $10}')
+
+# 返回原始累计值，后端会计算速率
+if [ -z "$READ_SECTORS" ]; then
+    READ_SECTORS=0
+fi
+if [ -z "$WRITE_SECTORS" ]; then
+    WRITE_SECTORS=0
+fi
+
+# 系统负载（作为运行状态的参考）
+LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | sed 's/,//')
+if [ -z "$LOAD_AVG" ]; then
+    LOAD_AVG=0
+fi
+
+# 输出JSON格式（返回累计扇区数，后端计算速率）
+printf '{"cpu_usage": %s, "mem_total": %s, "mem_used": %s, "mem_usage": %s, "disk_io": 0, "disk_io_bytes": 0, "disk_read_sectors": %s, "disk_write_sectors": %s, "load_avg": %s}\n' "$CPU_USAGE" "$MEM_TOTAL" "$MEM_USED" "$MEM_USAGE" "$READ_SECTORS" "$WRITE_SECTORS" "$LOAD_AVG"
+'''
+        
+        stdin, stdout, stderr = client.exec_command(script)
+        output = stdout.read().decode().strip()
+        error = stderr.read().decode().strip()
+        client.close()
+        
+        if error:
+            print(f"SSH获取性能数据错误: {error}")
+        
+        # 解析JSON结果
+        import json
+        import time
+        perf_data = json.loads(output)
+        
+        # 计算磁盘IO速率（基于10分钟间隔或首次建立基准）
+        current_time = time.time()
+        read_sectors = int(perf_data.get('disk_read_sectors', 0))
+        write_sectors = int(perf_data.get('disk_write_sectors', 0))
+        
+        if ip in diskstats_cache:
+            # 有缓存，计算速率
+            cached = diskstats_cache[ip]
+            time_diff = current_time - cached['timestamp']
+            
+            if time_diff >= 30:  # 至少间隔30秒才计算
+                read_diff = max(0, read_sectors - cached['read_sectors'])
+                write_diff = max(0, write_sectors - cached['write_sectors'])
+                
+                # 计算字节/秒（每扇区512字节）
+                disk_read_bytes = int(read_diff * 512 / time_diff)
+                disk_write_bytes = int(write_diff * 512 / time_diff)
+                disk_io_bytes = disk_read_bytes + disk_write_bytes
+                
+                perf_data['disk_io_bytes'] = disk_io_bytes
+                perf_data['disk_read_bytes'] = disk_read_bytes
+                perf_data['disk_write_bytes'] = disk_write_bytes
+                perf_data['disk_io'] = round(disk_io_bytes / (1024 * 1024), 2)
+                
+                print(f"[SSH IO] {ip}: {disk_io_bytes} bytes/s (间隔 {time_diff:.0f}s)")
+                
+                # 更新缓存
+                diskstats_cache[ip] = {
+                    'read_sectors': read_sectors,
+                    'write_sectors': write_sectors,
+                    'timestamp': current_time
+                }
+            else:
+                # 间隔太短，使用上次的IO值（或0）
+                perf_data['disk_io_bytes'] = 0
+                perf_data['disk_read_bytes'] = 0
+                perf_data['disk_write_bytes'] = 0
+                perf_data['disk_io'] = 0
+                print(f"[SSH IO] {ip}: 间隔太短 ({time_diff:.0f}s < 30s)，使用缓存")
+        else:
+            # 首次建立基准
+            diskstats_cache[ip] = {
+                'read_sectors': read_sectors,
+                'write_sectors': write_sectors,
+                'timestamp': current_time
+            }
+            perf_data['disk_io_bytes'] = 0
+            perf_data['disk_read_bytes'] = 0
+            perf_data['disk_write_bytes'] = 0
+            perf_data['disk_io'] = 0
+            print(f"[SSH IO] {ip}: 首次建立基准， sectors={read_sectors}/{write_sectors}")
+        
+        return perf_data, None
+    except ImportError:
+        return None, "paramiko模块未安装"
+    except Exception as e:
+        return None, f"SSH获取性能数据失败: {str(e)}"
+
+def get_ssh_logs(ip, username, password, lines=100, timeout=10):
+    """通过SSH获取服务器近期日志"""
+    try:
+        import paramiko
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(ip, port=22, username=username, password=password, timeout=timeout)
+        
+        # 获取系统日志（优先使用journalctl，否则使用/var/log/syslog）
+        script = '''
+#!/bin/bash
+if command -v journalctl &> /dev/null; then
+    journalctl --no-pager --since "24 hours ago" -n {lines} 2>/dev/null || journalctl --no-pager -n {lines}
+else
+    tail -n {lines} /var/log/syslog 2>/dev/null || tail -n {lines} /var/log/messages 2>/dev/null || echo "无法获取日志"
+fi
+'''.format(lines=lines)
+        
+        stdin, stdout, stderr = client.exec_command(script)
+        output = stdout.read().decode('utf-8', errors='ignore').strip()
+        error = stderr.read().decode('utf-8', errors='ignore').strip()
+        client.close()
+        
+        if error and not output:
+            return None, f"SSH获取日志错误: {error}"
+        
+        # 截取日志内容（限制长度）
+        max_length = 50000
+        if len(output) > max_length:
+            output = output[-max_length:]
+            output = "[日志过长，仅显示最近部分]\n..." + output
+            
+        return output, None
+    except ImportError:
+        return None, "paramiko模块未安装"
+    except Exception as e:
+        return None, f"SSH获取日志失败: {str(e)}"
+
+def get_proxmox_vm_performance(node_name, vmid, vm_type='qemu'):
+    """通过Proxmox API获取虚拟机性能数据"""
+    if not PROXMOX_AVAILABLE:
+        return None, "Proxmox API 不可用"
+    
+    try:
+        proxmox = get_proxmox_client()
+        if not proxmox:
+            return None, "Proxmox连接失败"
+        
+        # 获取虚拟机当前状态
+        if vm_type == 'lxc':
+            status = proxmox.nodes(node_name).lxc(vmid).status.current.get()
+        else:
+            status = proxmox.nodes(node_name).qemu(vmid).status.current.get()
+        
+        # 提取性能数据
+        maxmem = float(status.get('maxmem', 1) or 1)
+        mem = float(status.get('mem', 0) or 0)
+        cpu = float(status.get('cpu', 0) or 0)  # CPU使用率（0-1之间）
+        
+        # 转换为百分比
+        cpu_usage = round(cpu * 100, 2) if cpu else 0
+        mem_usage = round(mem / maxmem * 100, 2) if maxmem else 0
+        
+        # 内存转换为GB
+        mem_total_gb = round(maxmem / (1024**3), 2)
+        mem_used_gb = round(mem / (1024**3), 2)
+        
+        # 获取磁盘IO数据（通过RRRR数据接口）
+        disk_io_bytes = 0  # 总IO（字节/秒）
+        disk_read_bytes = 0  # 读IO（字节/秒）
+        disk_write_bytes = 0  # 写IO（字节/秒）
+        try:
+            # 使用rrddata接口获取原始RRD数据
+            if vm_type == 'lxc':
+                rrd_data = proxmox.nodes(node_name).lxc(vmid).rrddata.get(timeframe='hour', cf='AVERAGE')
+            else:
+                rrd_data = proxmox.nodes(node_name).qemu(vmid).rrddata.get(timeframe='hour', cf='AVERAGE')
+            
+            if rrd_data and len(rrd_data) > 0:
+                # 获取最新的数据点（过滤掉None值）
+                latest = None
+                for data in reversed(rrd_data):
+                    if data and (data.get('diskread') is not None or data.get('diskwrite') is not None):
+                        latest = data
+                        break
+                
+                if latest:
+                    # 磁盘IO字段：diskread和diskwrite（单位是字节/秒）
+                    disk_read_bytes = float(latest.get('diskread', 0) or 0)
+                    disk_write_bytes = float(latest.get('diskwrite', 0) or 0)
+                    disk_io_bytes = disk_read_bytes + disk_write_bytes
+        except Exception as e:
+            print(f"获取虚拟机磁盘IO失败: {e}")
+        
+        perf_data = {
+            'cpu_usage': cpu_usage,
+            'mem_total': mem_total_gb,
+            'mem_used': mem_used_gb,
+            'mem_usage': mem_usage,
+            'disk_io': round(disk_io_bytes / (1024 * 1024), 2),  # MB/s（用于饼图百分比）
+            'disk_io_bytes': disk_io_bytes,  # 字节/秒（用于前端动态单位）
+            'disk_read_bytes': disk_read_bytes,  # 字节/秒
+            'disk_write_bytes': disk_write_bytes,  # 字节/秒
+            'status': status.get('status', 'unknown')
+        }
+        return perf_data, None
+    except Exception as e:
+        return None, f"Proxmox获取性能数据失败: {str(e)}"
+
+def get_proxmox_node_performance(node_name):
+    """通过Proxmox API获取物理节点性能数据"""
+    if not PROXMOX_AVAILABLE:
+        return None, "Proxmox API 不可用"
+    
+    try:
+        proxmox = get_proxmox_client()
+        if not proxmox:
+            return None, "Proxmox连接失败"
+        
+        # 获取节点状态
+        status = proxmox.nodes(node_name).status.get()
+        
+        # 提取性能数据
+        memory = status.get('memory', {})
+        cpu_info = status.get('cpuinfo', {})
+        loadavg = status.get('loadavg', [0, 0, 0])
+        
+        mem_total = float(memory.get('total', 1) or 1)
+        mem_used = float(memory.get('used', 0) or 0)
+        mem_free = float(memory.get('free', 0) or 0)
+        
+        # 计算内存使用率
+        mem_usage = round(mem_used / mem_total * 100, 2) if mem_total else 0
+        cpu_cores = int(cpu_info.get('cpus', 1) or 1)
+        load_avg = float(loadavg[0] if isinstance(loadavg, list) and len(loadavg) > 0 else 0)
+        # 估算CPU使用率（基于负载）
+        cpu_usage = round(min(load_avg / cpu_cores * 100, 100), 2) if cpu_cores else 0
+        
+        # 获取磁盘IO数据
+        # 注意：Proxmox节点的rrddata没有diskread/diskwrite字段
+        # 只能通过rrddata获取到iowait（IO等待时间），这不是吞吐量
+        # 物理机磁盘IO暂时无法通过Proxmox API获取
+        disk_io_bytes = 0
+        disk_read_bytes = 0
+        disk_write_bytes = 0
+        
+        perf_data = {
+            'cpu_usage': cpu_usage,
+            'mem_total': round(mem_total / (1024**3), 2),
+            'mem_used': round(mem_used / (1024**3), 2),
+            'mem_usage': mem_usage,
+            'disk_io': round(disk_io_bytes / (1024 * 1024), 2),
+            'disk_io_bytes': disk_io_bytes,
+            'disk_read_bytes': disk_read_bytes,
+            'disk_write_bytes': disk_write_bytes,
+            'load_avg': load_avg
+        }
+        return perf_data, None
+    except Exception as e:
+        return None, f"Proxmox获取节点性能数据失败: {str(e)}"
 
 def get_proxmox_client():
     """创建 Proxmox API 客户端"""
@@ -587,11 +1080,63 @@ textarea { resize: vertical; min-height: 80px; }
 .btn-cancel:hover { background: #e0e0e0; }
 .btn-save { padding: 12px 30px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
 .btn-save:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(102, 126, 234, 0.3); }
+.btn-verify { padding: 12px 24px; background: linear-gradient(135deg, #4caf50 0%, #388e3c 100%); color: white; border: none; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 600; }
+.btn-verify:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(76, 175, 80, 0.3); }
+.btn-verify:disabled { background: #cccccc; cursor: not-allowed; transform: none; box-shadow: none; }
+.verify-status { margin-left: 10px; font-size: 14px; font-weight: 600; }
+.verify-status.success { color: #4caf50; }
+.verify-status.error { color: #f44336; }
 .empty-state { text-align: center; padding: 80px 40px; color: #888; }
 .stats { display: flex; gap: 20px; margin-bottom: 25px; }
 .stat-card { background: white; padding: 15px 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05); }
 .stat-label { font-size: 12px; color: #888; margin-bottom: 5px; }
 .stat-value { font-size: 24px; font-weight: 700; color: #333; }
+
+/* 性能监控面板样式 */
+.performance-panel { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05); margin-bottom: 25px; display: none; }
+.performance-panel.active { display: block; }
+.tab-label { display: none; padding: 10px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 10px 10px 0 0; font-size: 16px; font-weight: 600; margin-bottom: 0; }
+.tab-label.active { display: inline-block; }
+.tab-label.inventory-tab { display: inline-block; }
+.performance-header { display: flex; align-items: center; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #eee; }
+.performance-hostname { font-size: 20px; font-weight: 700; color: #333; margin-right: 15px; }
+.performance-status { padding: 5px 12px; border-radius: 15px; font-size: 12px; font-weight: 600; }
+.performance-status.running { background: #e8f5e9; color: #2e7d32; }
+.performance-status.stopped { background: #ffebee; color: #c62828; }
+.performance-actions { margin-left: auto; display: flex; gap: 10px; }
+.btn-refresh, .btn-clear { padding: 6px 14px; border: none; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; transition: all 0.2s ease; }
+.btn-refresh { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+.btn-refresh:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(102, 126, 234, 0.3); }
+.btn-clear { background: #f5f5f5; color: #666; }
+.btn-clear:hover { background: #e0e0e0; }
+.btn-ai-diagnosis { padding: 8px 18px; border: none; border-radius: 6px; font-size: 13px; font-weight: 700; cursor: pointer; transition: all 0.2s ease; background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%); color: white; box-shadow: 0 2px 8px rgba(255, 107, 107, 0.3); }
+.btn-ai-diagnosis:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(255, 107, 107, 0.4); }
+.btn-ai-diagnosis:disabled { background: #ccc; cursor: not-allowed; box-shadow: none; }
+.btn-separator { width: 1px; height: 24px; background: #ddd; margin: 0 8px; }
+.ai-diagnosis-dialog { margin-top: 25px; padding: 20px; background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border-radius: 12px; border-left: 4px solid #ff6b6b; display: none; }
+.ai-diagnosis-dialog.active { display: block; }
+.ai-diagnosis-header { display: flex; align-items: center; margin-bottom: 15px; }
+.ai-diagnosis-icon { width: 32px; height: 32px; background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%); border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-size: 16px; margin-right: 12px; }
+.ai-diagnosis-title { font-size: 16px; font-weight: 700; color: #333; }
+.ai-diagnosis-collapse { margin-left: auto; font-size: 13px; color: #888; cursor: pointer; transition: color 0.2s ease; user-select: none; }
+.ai-diagnosis-collapse:hover { color: #ff6b6b; }
+.ai-diagnosis-content { font-size: 14px; line-height: 1.8; color: #555; min-height: 60px; max-height: calc(14px * 1.8 * 10); overflow-y: auto; }
+.ai-diagnosis-content .typing-cursor { display: inline-block; width: 2px; height: 16px; background: #ff6b6b; animation: blink 1s infinite; margin-left: 2px; }
+@keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+.performance-charts { display: flex; justify-content: space-around; align-items: center; flex-wrap: wrap; gap: 30px; }
+.chart-container { display: flex; flex-direction: column; align-items: center; }
+.chart-label { margin-top: 10px; font-size: 14px; color: #666; font-weight: 500; }
+.chart-value { margin-top: 5px; font-size: 12px; color: #888; }
+
+/* SVG饼图样式 */
+.pie-chart { width: 120px; height: 120px; }
+.pie-chart circle { fill: none; stroke-width: 20; }
+.pie-chart .pie-bg { stroke: #e9ecef; }
+.pie-chart .pie-fill { stroke-linecap: round; transition: stroke-dasharray 0.5s ease; }
+.pie-chart.cpu .pie-fill { stroke: #667eea; }
+.pie-chart.mem .pie-fill { stroke: #764ba2; }
+.pie-chart.disk .pie-fill { stroke: #4caf50; }
+
 .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; flex-wrap: wrap; gap: 10px; }
 .batch-actions { display: none; }
 .batch-actions.active { display: flex; }
@@ -785,6 +1330,26 @@ class Handler(BaseHTTPRequestHandler):
                             'used_gpus': list(used_gpus)
                         })
         
+        elif path == '/api/verify_ssh':
+            # API: 验证SSH连接
+            if not session:
+                self.send_json({'success': False, 'error': '未登录'})
+            elif session.get('role') != 'admin':
+                self.send_json({'success': False, 'error': '无权限'})
+            else:
+                query = urllib.parse.parse_qs(parsed.query)
+                ip = query.get('ip', [''])[0]
+                username = query.get('username', [''])[0]
+                password = query.get('password', [''])[0]
+                if not ip or not username or not password:
+                    self.send_json({'success': False, 'error': '缺少必要参数(IP、用户名或密码)'})
+                else:
+                    success, error = verify_ssh_connection(ip, username, password)
+                    if success:
+                        self.send_json({'success': True, 'message': 'SSH连接验证成功'})
+                    else:
+                        self.send_json({'success': False, 'error': error})
+        
         elif path == '/api/vm_info':
             # API: 获取虚拟机详细信息
             if not session:
@@ -804,6 +1369,242 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json({'success': False, 'error': error})
                     else:
                         self.send_json({'success': True, 'info': vm_info})
+        
+        elif path == '/api/performance':
+            # API: 获取服务器性能数据
+            if not session:
+                self.send_json({'success': False, 'error': '未登录'})
+            else:
+                query = urllib.parse.parse_qs(parsed.query)
+                server_id = query.get('id', [''])[0]
+                if not server_id:
+                    self.send_json({'success': False, 'error': '缺少服务器ID'})
+                else:
+                    try:
+                        server_id = int(server_id)
+                    except ValueError:
+                        self.send_json({'success': False, 'error': '无效的服务器ID'})
+                        return
+                    
+                    data = load_data()
+                    server = None
+                    for s in data['servers']:
+                        if s['id'] == server_id:
+                            server = s
+                            break
+                    
+                    if not server:
+                        self.send_json({'success': False, 'error': '服务器不存在'})
+                        return
+                    
+                    # 判断注册方式
+                    reg_type = server.get('reg_type', 'manual')
+                    is_auto = reg_type == 'auto' or server.get('proxmox_vmid') is not None
+                    
+                    perf_data = None
+                    error = None
+                    
+                    if is_auto:
+                        # 自动注册：通过Proxmox API获取
+                        hostname = server['hostname']
+                        if server['type'] == 'physical':
+                            # 物理机
+                            perf_data, error = get_proxmox_node_performance(hostname)
+                        else:
+                            # 虚拟机
+                            vmid = server.get('proxmox_vmid')
+                            if vmid:
+                                # 通过parent_host找到节点名
+                                node_name = server.get('parent_host', '')
+                                if node_name:
+                                    perf_data, error = get_proxmox_vm_performance(node_name, vmid, 'qemu')
+                                else:
+                                    error = '无法确定虚拟机所在节点'
+                            else:
+                                error = '虚拟机没有proxmox_vmid'
+                    else:
+                        # 手动注册：通过SSH获取
+                        # 从服务器数据中获取SSH凭据
+                        ssh_user = server.get('ssh_user')
+                        ssh_password = server.get('ssh_password')
+                        
+                        if not ssh_user or not ssh_password:
+                            # 如果没有存储凭据，返回错误
+                            error = '没有存储SSH凭据，无法获取性能数据'
+                        else:
+                            ip = server['ip']
+                            perf_data, error = get_ssh_performance(ip, ssh_user, ssh_password)
+                    
+                    if error or perf_data is None:
+                        self.send_json({'success': False, 'error': error or '获取性能数据失败'})
+                    else:
+                        # 添加服务器基本信息
+                        print(f"性能数据返回: {perf_data}")  # 调试输出
+                        result = {
+                            'success': True,
+                            'hostname': server['hostname'],
+                            'type': server['type'],
+                            'status': perf_data.get('status', 'running'),
+                            'performance': perf_data
+                        }
+                        self.send_json(result)
+        
+        elif path == '/api/server_logs':
+            # API: 获取服务器日志（用于AI诊断）
+            if not session:
+                self.send_json({'success': False, 'error': '未登录'})
+            else:
+                query = urllib.parse.parse_qs(parsed.query)
+                server_id = query.get('id', [''])[0]
+                if not server_id:
+                    self.send_json({'success': False, 'error': '缺少服务器ID'})
+                else:
+                    try:
+                        server_id = int(server_id)
+                    except ValueError:
+                        self.send_json({'success': False, 'error': '无效的服务器ID'})
+                        return
+                    
+                    data = load_data()
+                    server = None
+                    for s in data['servers']:
+                        if s['id'] == server_id:
+                            server = s
+                            break
+                    
+                    if not server:
+                        self.send_json({'success': False, 'error': '服务器不存在'})
+                        return
+                    
+                    # 只支持手动注册的服务器（通过SSH获取日志）
+                    reg_type = server.get('reg_type', 'manual')
+                    is_auto = reg_type == 'auto' or server.get('proxmox_vmid') is not None
+                    
+                    if is_auto:
+                        self.send_json({'success': False, 'error': '自动注册的服务器暂不支持日志获取'})
+                        return
+                    
+                    # 手动注册：通过SSH获取日志
+                    ssh_user = server.get('ssh_user')
+                    ssh_password = server.get('ssh_password')
+                    
+                    if not ssh_user or not ssh_password:
+                        self.send_json({'success': False, 'error': '没有存储SSH凭据，无法获取日志'})
+                        return
+                    
+                    ip = server['ip']
+                    logs, error = get_ssh_logs(ip, ssh_user, ssh_password, lines=100)
+                    
+                    if error:
+                        self.send_json({'success': False, 'error': error})
+                    else:
+                        self.send_json({
+                            'success': True,
+                            'logs': logs,
+                            'hostname': server['hostname']
+                        })
+        
+        elif path == '/api/ai_diagnosis':
+            # API: AI 流式诊断
+            if not session:
+                self.send_json({'success': False, 'error': '未登录'})
+            else:
+                query = urllib.parse.parse_qs(parsed.query)
+                server_id = query.get('id', [''])[0]
+                if not server_id:
+                    self.send_json({'success': False, 'error': '缺少服务器ID'})
+                else:
+                    try:
+                        server_id = int(server_id)
+                    except ValueError:
+                        self.send_json({'success': False, 'error': '无效的服务器ID'})
+                        return
+                    
+                    data = load_data()
+                    server = None
+                    for s in data['servers']:
+                        if s['id'] == server_id:
+                            server = s
+                            break
+                    
+                    if not server:
+                        self.send_json({'success': False, 'error': '服务器不存在'})
+                        return
+                    
+                    # 获取性能数据
+                    reg_type = server.get('reg_type', 'manual')
+                    is_auto = reg_type == 'auto' or server.get('proxmox_vmid') is not None
+                    
+                    perf_data = None
+                    logs = None
+                    error = None
+                    
+                    if is_auto:
+                        # 自动注册：通过Proxmox API获取
+                        hostname = server['hostname']
+                        if server['type'] == 'physical':
+                            perf_data, error = get_proxmox_node_performance(hostname)
+                        else:
+                            vmid = server.get('proxmox_vmid')
+                            if vmid:
+                                node_name = server.get('parent_host', '')
+                                if node_name:
+                                    perf_data, error = get_proxmox_vm_performance(node_name, vmid, 'qemu')
+                                else:
+                                    error = '无法确定虚拟机所在节点'
+                            else:
+                                error = '虚拟机没有proxmox_vmid'
+                        logs = "自动注册的服务器暂不支持日志获取"
+                    else:
+                        # 手动注册：通过SSH获取
+                        ssh_user = server.get('ssh_user')
+                        ssh_password = server.get('ssh_password')
+                        
+                        if not ssh_user or not ssh_password:
+                            error = '没有存储SSH凭据'
+                        else:
+                            ip = server['ip']
+                            perf_data, perf_error = get_ssh_performance(ip, ssh_user, ssh_password)
+                            if perf_error:
+                                error = perf_error
+                            else:
+                                logs, log_error = get_ssh_logs(ip, ssh_user, ssh_password, lines=100)
+                                if log_error:
+                                    logs = f"获取日志失败: {log_error}"
+                    
+                    if error:
+                        self.send_json({'success': False, 'error': error})
+                        return
+                    
+                    # 构建服务器信息
+                    server_info = {
+                        'hostname': server['hostname'],
+                        'ip': server['ip'],
+                        'type': server['type']
+                    }
+                    
+                    # 构建提示词
+                    prompt = build_diagnosis_prompt(perf_data or {}, logs or "", server_info)
+                    
+                    # 设置流式响应头
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/plain; charset=utf-8')
+                    self.send_header('Cache-Control', 'no-cache')
+                    self.send_header('X-Accel-Buffering', 'no')
+                    self.end_headers()
+                    
+                    # 调用 DeepSeek API 并流式输出
+                    messages = [
+                        {"role": "system", "content": "你是一位专业的服务器运维专家，擅长分析系统性能和日志。请用中文给出专业但易懂的诊断报告。"},
+                        {"role": "user", "content": prompt}
+                    ]
+                    
+                    try:
+                        for chunk in deepseek_chat_stream(messages):
+                            self.wfile.write(chunk.encode('utf-8'))
+                            self.wfile.flush()
+                    except Exception as e:
+                        self.wfile.write(f"\n[流式输出中断: {str(e)}]".encode('utf-8'))
         
         else:
             self.send_html('<h1>404</h1>', 404)
@@ -908,8 +1709,16 @@ class Handler(BaseHTTPRequestHandler):
                         'gpu_count': final_gpu_count,
                         'assigned_gpus': gpus,
                         'user': form.get('user', [''])[0],
-                        'reg_type': form.get('reg_type', ['manual'])[0]  # 注册方式: auto/manual
+                        'reg_type': form.get('reg_type', ['manual'])[0],  # 注册方式: auto/manual
+                        'ssh_verified': form.get('ssh_verified', ['false'])[0] == 'true'  # SSH验证状态
                     }
+                    
+                    # 添加手动注册特有的SSH凭据
+                    ssh_user = form.get('ssh_user', [''])[0]
+                    ssh_password = form.get('ssh_password', [''])[0]
+                    if ssh_user and ssh_password:
+                        new_server['ssh_user'] = ssh_user
+                        new_server['ssh_password'] = ssh_password
                     
                     # 添加虚拟机特有的字段
                     if parent_host:
@@ -1172,6 +1981,16 @@ class Handler(BaseHTTPRequestHandler):
                 # 获取注册方式（auto/manual），默认为manual
                 reg_type = s.get('reg_type', 'manual')
                 
+                # 判断是否为主机名添加下划线
+                # 自动注册（auto或有proxmox_vmid字段）始终添加下划线
+                # 手动注册（manual）只有通过了SSH验证才添加下划线
+                ssh_verified = s.get('ssh_verified', False)
+                is_auto = reg_type == 'auto' or s.get('proxmox_vmid') is not None
+                if is_auto or ssh_verified:
+                    hostname_display = f'<span class="clickable-hostname" style="text-decoration: underline; cursor: pointer; color: #667eea;" onclick="showPerformance({s["id"]}, event)">{s["hostname"]}</span>'
+                else:
+                    hostname_display = s['hostname']
+                
                 if is_physical:
                     # 物理机：折叠按钮单独一列，存储注册方式
                     expand_cell = f'<span class="expand-btn" data-pid="{s["id"]}" onclick="toggleVmList(event, {s["id"]})">▶</span>' if has_children else ''
@@ -1197,7 +2016,7 @@ class Handler(BaseHTTPRequestHandler):
                 return f'''<tr data-id="{s['id']}" class="{row_class}" {data_attr}>
                     {checkbox_col}
                     <td class="expand-col">{expand_cell}</td>
-                    <td class="hostname">{s['hostname']}</td>
+                    <td class="hostname">{hostname_display}</td>
                     <td>{s['user']}</td>
                     <td><span class="type-badge {tcls}">{ttxt}</span></td>
                     <td>{purpose_cell}</td>
@@ -1322,6 +2141,7 @@ class Handler(BaseHTTPRequestHandler):
                 <form method="POST" action="/add" id="addForm">
                     <input type="hidden" name="type" value="physical">
                     <input type="hidden" name="reg_type" value="auto">
+                    <input type="hidden" name="ssh_verified" value="true">
                     <div class="modal-body">
                         <div class="form-row">
                             <div class="form-group">
@@ -1397,6 +2217,7 @@ class Handler(BaseHTTPRequestHandler):
                 <form method="POST" action="/add" id="manualAddForm">
                     <input type="hidden" name="type" value="physical">
                     <input type="hidden" name="reg_type" value="manual">
+                    <input type="hidden" name="ssh_verified" id="manualSshVerified" value="false">
                     <div class="modal-body">
                         <div class="form-row">
                             <div class="form-group">
@@ -1406,6 +2227,16 @@ class Handler(BaseHTTPRequestHandler):
                             <div class="form-group">
                                 <label>IP地址 *</label>
                                 <input type="text" name="ip" id="manualIp" required>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>SSH用户名 *</label>
+                                <input type="text" name="ssh_user" id="manualSshUser" required>
+                            </div>
+                            <div class="form-group">
+                                <label>SSH密码 *</label>
+                                <input type="password" name="ssh_password" id="manualSshPassword" required>
                             </div>
                         </div>
                         <div class="form-row">
@@ -1455,9 +2286,14 @@ class Handler(BaseHTTPRequestHandler):
                             <input type="text" name="user" id="manualUser" required>
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn-cancel" onclick="closeManualAddModal()">取消</button>
-                        <button type="submit" class="btn-save">保存</button>
+                    </div>
+                    <div class="modal-footer" style="flex-direction: column; align-items: stretch; border-top: none;">
+                        <div id="manualVerifyStatusArea" style="padding: 10px 0; text-align: center; min-height: 24px;"></div>
+                        <div style="display: flex; justify-content: flex-end; gap: 15px; width: 100%;">
+                            <button type="button" class="btn-cancel" onclick="closeManualAddModal()">取消</button>
+                            <button type="button" class="btn-verify" id="manualVerifyBtn" onclick="verifyManualHost()">验证连接</button>
+                            <button type="submit" class="btn-save" id="manualSaveBtn" onclick="return checkManualVerified()">保存</button>
+                        </div>
                     </div>
                 </form>
             </div>
@@ -1493,6 +2329,8 @@ class Handler(BaseHTTPRequestHandler):
                 </div>
                 <form method="POST" action="/add" id="addVmForm">
                     <input type="hidden" name="type" value="virtual">
+                    <input type="hidden" name="reg_type" value="auto">
+                    <input type="hidden" name="ssh_verified" value="true">
                     <input type="hidden" name="parent_host" id="vmParentHost" value="">
                     <input type="hidden" name="proxmox_vmid" id="vmProxmoxVmid" value="">
                     <div class="modal-body">
@@ -1576,6 +2414,7 @@ class Handler(BaseHTTPRequestHandler):
                 <form method="POST" action="/add" id="manualAddVmForm">
                     <input type="hidden" name="type" value="virtual">
                     <input type="hidden" name="parent_host" id="manualVmParentHost" value="">
+                    <input type="hidden" name="ssh_verified" id="manualVmSshVerified" value="false">
                     <div class="modal-body">
                         <div class="form-row">
                             <div class="form-group">
@@ -1585,6 +2424,16 @@ class Handler(BaseHTTPRequestHandler):
                             <div class="form-group">
                                 <label>IP地址 *</label>
                                 <input type="text" name="ip" id="manualVmIp" required>
+                            </div>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label>SSH用户名 *</label>
+                                <input type="text" name="ssh_user" id="manualVmSshUser" required>
+                            </div>
+                            <div class="form-group">
+                                <label>SSH密码 *</label>
+                                <input type="password" name="ssh_password" id="manualVmSshPassword" required>
                             </div>
                         </div>
                         <div class="form-row">
@@ -1640,9 +2489,14 @@ class Handler(BaseHTTPRequestHandler):
                             <input type="text" name="user" id="manualVmUser" required>
                         </div>
                     </div>
-                    <div class="modal-footer">
-                        <button type="button" class="btn-cancel" onclick="closeManualAddVmModal()">取消</button>
-                        <button type="submit" class="btn-save">保存</button>
+                    </div>
+                    <div class="modal-footer" style="flex-direction: column; align-items: stretch; border-top: none;">
+                        <div id="manualVmVerifyStatusArea" style="padding: 10px 0; text-align: center; min-height: 24px;"></div>
+                        <div style="display: flex; justify-content: flex-end; gap: 15px; width: 100%;">
+                            <button type="button" class="btn-cancel" onclick="closeManualAddVmModal()">取消</button>
+                            <button type="button" class="btn-verify" id="manualVmVerifyBtn" onclick="verifyManualVmHost()">验证连接</button>
+                            <button type="submit" class="btn-save" id="manualVmSaveBtn" onclick="return checkManualVmVerified()">保存</button>
+                        </div>
                     </div>
                 </form>
             </div>
@@ -1679,6 +2533,56 @@ class Handler(BaseHTTPRequestHandler):
                 <div class="stat-value">{total_assigned_gpus}/{total_physical_gpus}</div>
             </div>
         </div>
+        
+        <!-- 性能监控面板 -->
+        <div class="tab-label" id="perfTabLabel">Server Insights</div>
+        <div class="performance-panel" id="performancePanel">
+            <div class="performance-header">
+                <span class="performance-hostname" id="perfHostname">--</span>
+                <span class="performance-status" id="perfStatus">--</span>
+                <div class="performance-actions">
+                    <button class="btn-ai-diagnosis" id="perfAiDiagnosisBtn" title="AI智能诊断">AI诊断</button>
+                    <div class="btn-separator"></div>
+                    <button class="btn-refresh" id="perfRefreshBtn" title="刷新性能数据">刷新</button>
+                    <button class="btn-clear" id="perfClearBtn" title="关闭性能面板">关闭</button>
+                </div>
+            </div>
+            <div class="performance-charts">
+                <div class="chart-container">
+                    <svg class="pie-chart cpu" viewBox="0 0 120 120">
+                        <circle class="pie-bg" cx="60" cy="60" r="40"/>
+                        <circle class="pie-fill" cx="60" cy="60" r="40" stroke-dasharray="0 251.2" transform="rotate(-90 60 60)"/>
+                    </svg>
+                    <div class="chart-label">CPU使用率</div>
+                    <div class="chart-value" id="cpuValue">--%</div>
+                </div>
+                <div class="chart-container">
+                    <svg class="pie-chart mem" viewBox="0 0 120 120">
+                        <circle class="pie-bg" cx="60" cy="60" r="40"/>
+                        <circle class="pie-fill" cx="60" cy="60" r="40" stroke-dasharray="0 251.2" transform="rotate(-90 60 60)"/>
+                    </svg>
+                    <div class="chart-label">内存使用率</div>
+                    <div class="chart-value" id="memValue">--%</div>
+                </div>
+                <div class="chart-container">
+                    <svg class="pie-chart disk" viewBox="0 0 120 120">
+                        <circle class="pie-bg" cx="60" cy="60" r="40"/>
+                        <circle class="pie-fill" cx="60" cy="60" r="40" stroke-dasharray="0 251.2" transform="rotate(-90 60 60)"/>
+                    </svg>
+                    <div class="chart-label">磁盘IO</div>
+                    <div class="chart-value" id="diskValue">-- MB/s</div>
+                </div>
+            </div>
+            <div class="ai-diagnosis-dialog" id="aiDiagnosisDialog">
+                <div class="ai-diagnosis-header">
+                    <div class="ai-diagnosis-icon">AI</div>
+                    <div class="ai-diagnosis-title">智能诊断报告</div>
+                    <span class="ai-diagnosis-collapse" id="aiDiagnosisCollapse"><< 收起</span>
+                </div>
+                <div class="ai-diagnosis-content" id="aiDiagnosisContent"></div>
+            </div>
+        </div>
+        
         <div class="toolbar">
             <div style="display:flex;align-items:center;">
                 {batch_buttons}
@@ -1690,6 +2594,7 @@ class Handler(BaseHTTPRequestHandler):
                 {add_button}
             </div>
         </div>
+        <div class="tab-label inventory-tab">Inventory</div>
         <div class="table-container">
             <table>
                 <thead>
@@ -1741,17 +2646,10 @@ class Handler(BaseHTTPRequestHandler):
         }});
         
         // 手动添加物理机弹窗
-        function openManualAddModal() {{ 
-            document.getElementById('manualAddModal').classList.add('active'); 
+        function openManualAddModal() {{
+            document.getElementById('manualAddModal').classList.add('active');
             document.getElementById('manualHostname').focus();
         }}
-        function closeManualAddModal() {{ 
-            document.getElementById('manualAddModal').classList.remove('active'); 
-            document.getElementById('manualAddForm').reset();
-        }}
-        document.getElementById('manualAddModal').addEventListener('click', (e) => {{ 
-            if (e.target === e.currentTarget) closeManualAddModal(); 
-        }});
         
         // 获取节点信息
         async function fetchNodeInfo() {{
@@ -2297,11 +3195,386 @@ class Handler(BaseHTTPRequestHandler):
         function closeManualAddVmModal() {{
             document.getElementById('manualAddVmModal').classList.remove('active');
             document.getElementById('manualAddVmForm').reset();
+            // 清除验证状态和按钮文字
+            manualVmVerified = false;
+            document.getElementById('manualVmVerifyStatusArea').innerHTML = '';
+            document.getElementById('manualVmSaveBtn').textContent = '保存';
+        }}
+        
+        // SSH验证状态
+        let manualVerified = false;
+        let manualVmVerified = false;
+        
+        // 更新验证状态显示
+        function updateVerifyStatus(elementId, message, isSuccess) {{
+            let statusEl = document.getElementById(elementId);
+            if (!statusEl) {{
+                statusEl = document.createElement('span');
+                statusEl.id = elementId;
+                statusEl.className = 'verify-status';
+            }}
+            statusEl.textContent = message;
+            statusEl.className = 'verify-status' + (isSuccess ? ' success' : ' error');
+            return statusEl;
+        }}
+        
+        // 验证手动注册物理机的SSH连接
+        async function verifyManualHost() {{
+            const ip = document.getElementById('manualIp').value.trim();
+            const username = document.getElementById('manualSshUser').value.trim();
+            const password = document.getElementById('manualSshPassword').value;
+            const verifyBtn = document.getElementById('manualVerifyBtn');
+            const saveBtn = document.getElementById('manualSaveBtn');
+            const statusArea = document.getElementById('manualVerifyStatusArea');
+            
+            if (!ip || !username || !password) {{
+                alert('请先填写IP地址、SSH用户名和密码');
+                return;
+            }}
+            
+            verifyBtn.disabled = true;
+            verifyBtn.textContent = '验证中...';
+            
+            try {{
+                const response = await fetch('/api/verify_ssh?ip=' + encodeURIComponent(ip) + 
+                    '&username=' + encodeURIComponent(username) + 
+                    '&password=' + encodeURIComponent(password));
+                const data = await response.json();
+                
+                // 在按钮上方的区域显示状态
+                statusArea.innerHTML = data.success 
+                    ? '<span class="verify-status success">✓ 验证通过</span>'
+                    : '<span class="verify-status error">✗ ' + data.error + '</span>';
+                
+                manualVerified = data.success;
+                
+                // 更新隐藏字段记录验证状态
+                document.getElementById('manualSshVerified').value = data.success ? 'true' : 'false';
+                
+                // 根据验证结果修改保存按钮文字
+                if (data.success) {{
+                    saveBtn.textContent = '保存';
+                }} else {{
+                    saveBtn.textContent = '仍然保存';
+                }}
+            }} catch (err) {{
+                statusArea.innerHTML = '<span class="verify-status error">✗ 验证请求失败: ' + err.message + '</span>';
+                saveBtn.textContent = '仍然保存';
+                document.getElementById('manualSshVerified').value = 'false';
+            }} finally {{
+                verifyBtn.disabled = false;
+                verifyBtn.textContent = '验证连接';
+            }}
+        }}
+        
+        // 检查手动注册物理机是否已验证（允许未验证时保存）
+        function checkManualVerified() {{
+            // 始终允许保存，不再弹窗提示
+            return true;
+        }}
+        
+        // 验证手动添加虚拟机的SSH连接
+        async function verifyManualVmHost() {{
+            const ip = document.getElementById('manualVmIp').value.trim();
+            const username = document.getElementById('manualVmSshUser').value.trim();
+            const password = document.getElementById('manualVmSshPassword').value;
+            const verifyBtn = document.getElementById('manualVmVerifyBtn');
+            const saveBtn = document.getElementById('manualVmSaveBtn');
+            const statusArea = document.getElementById('manualVmVerifyStatusArea');
+            
+            if (!ip || !username || !password) {{
+                alert('请先填写IP地址、SSH用户名和密码');
+                return;
+            }}
+            
+            verifyBtn.disabled = true;
+            verifyBtn.textContent = '验证中...';
+            
+            try {{
+                const response = await fetch('/api/verify_ssh?ip=' + encodeURIComponent(ip) + 
+                    '&username=' + encodeURIComponent(username) + 
+                    '&password=' + encodeURIComponent(password));
+                const data = await response.json();
+                
+                // 在按钮上方的区域显示状态
+                statusArea.innerHTML = data.success 
+                    ? '<span class="verify-status success">✓ 验证通过</span>'
+                    : '<span class="verify-status error">✗ ' + data.error + '</span>';
+                
+                manualVmVerified = data.success;
+                
+                // 更新隐藏字段记录验证状态
+                document.getElementById('manualVmSshVerified').value = data.success ? 'true' : 'false';
+                
+                // 根据验证结果修改保存按钮文字
+                if (data.success) {{
+                    saveBtn.textContent = '保存';
+                }} else {{
+                    saveBtn.textContent = '仍然保存';
+                }}
+            }} catch (err) {{
+                statusArea.innerHTML = '<span class="verify-status error">✗ 验证请求失败: ' + err.message + '</span>';
+                saveBtn.textContent = '仍然保存';
+                document.getElementById('manualVmSshVerified').value = 'false';
+            }} finally {{
+                verifyBtn.disabled = false;
+                verifyBtn.textContent = '验证连接';
+            }}
+        }}
+        
+        // 检查手动添加虚拟机是否已验证（允许未验证时保存）
+        function checkManualVmVerified() {{
+            // 始终允许保存，不再弹窗提示
+            return true;
+        }}
+        
+        // 关闭弹窗时重置验证状态
+        function closeManualAddModal() {{
+            document.getElementById('manualAddModal').classList.remove('active');
+            document.getElementById('manualAddForm').reset();
+            manualVerified = false;
+            document.getElementById('manualVerifyStatusArea').innerHTML = '';
+            document.getElementById('manualSaveBtn').textContent = '保存';
         }}
         
         function updateGpuCount() {{
             const checkedGpus = document.querySelectorAll('.gpu-selection input[type="checkbox"]:checked');
             document.getElementById('gpuCount').value = checkedGpus.length;
+        }}
+        
+        // 显示性能监控面板
+        // 当前显示性能的服务器ID
+        let currentPerfServerId = null;
+        // 日志缓存：{{serverId: {{logs: string, timestamp: number}}}}
+        let logsCache = {{}};
+        
+        // Markdown 渲染函数（简化版）
+        function renderMarkdown(text) {{
+            // 先处理代码块，避免代码块内的内容被其他规则处理
+            let codeBlocks = [];
+            text = text.replace(/```([\\s\\S]*?)```/g, function(match, code) {{
+                codeBlocks.push('<pre style="background:#f5f5f5;padding:6px 8px;border-radius:4px;overflow-x:auto;margin:4px 0;font-size:13px;"><code>' + 
+                    code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') + 
+                    '</code></pre>');
+                return '\\x00CODEBLOCK' + (codeBlocks.length - 1) + '\\x00';
+            }});
+            
+            // 处理换行：将多个连续换行合并为1个，然后删除标题/列表前后的换行
+            text = text.replace(/\\n\\n+/g, '\\n');
+            
+            return text
+                // 转义 HTML 特殊字符（代码块已处理）
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                // 行内代码 `...`
+                .replace(/`([^`]+)`/g, '<code style="background:#f5f5f5;padding:1px 4px;border-radius:3px;font-family:monospace;font-size:13px;">$1</code>')
+                // 标题 ## ...（紧凑样式，下边距很小）
+                .replace(/^## (.*$)/gim, '<h2 style="font-size:16px;font-weight:700;margin:8px 0 2px;color:#333;border-bottom:1px solid #eee;padding-bottom:2px;">$1</h2>')
+                .replace(/^### (.*$)/gim, '<h3 style="font-size:14px;font-weight:600;margin:6px 0 2px;color:#444;">$1</h3>')
+                // 粗体 **...**
+                .replace(/\\*\\*(.*?)\\*\\*/g, '<strong style="font-weight:600;">$1</strong>')
+                // 斜体 *...*
+                .replace(/\\*([^*]+)\\*/g, '<em>$1</em>')
+                // 列表项 - ...（更紧凑的边距）
+                .replace(/^- (.*$)/gim, '<li style="margin:1px 0;margin-left:20px;line-height:1.5;">$1</li>')
+                // 删除标题和列表标记后面的换行（避免空行）
+                .replace(/(<h[23][^>]*>)<br>/gi, '$1')
+                .replace(/(<li[^>]*>)<br>/gi, '$1')
+                // 单个换行转为 <br>（但为了紧凑，相邻的br合并）
+                .replace(/\\n/g, '<br>')
+                .replace(/(<br>)+/g, '<br>')
+                // 恢复代码块
+                .replace(/\\x00CODEBLOCK(\\d+)\\x00/g, function(match, index) {{
+                    return codeBlocks[parseInt(index)];
+                }});
+        }}
+        
+        // 预加载日志（后台获取）
+        async function preloadLogs(serverId) {{
+            try {{
+                const response = await fetch('/api/server_logs?id=' + serverId);
+                const data = await response.json();
+                if (data.success) {{
+                    logsCache[serverId] = {{
+                        logs: data.logs,
+                        timestamp: Date.now()
+                    }};
+                    console.log('日志预加载完成:', serverId);
+                }} else {{
+                    console.log('日志预加载失败:', data.error);
+                }}
+            }} catch (err) {{
+                console.log('日志预加载错误:', err);
+            }}
+        }}
+        
+        async function showPerformance(serverId, event) {{
+            if (event) event.stopPropagation();
+            
+            currentPerfServerId = serverId;
+            const panel = document.getElementById('performancePanel');
+            const tabLabel = document.getElementById('perfTabLabel');
+            const hostnameEl = document.getElementById('perfHostname');
+            const statusEl = document.getElementById('perfStatus');
+            
+            // 显示页签和面板
+            tabLabel.classList.add('active');
+            panel.classList.add('active');
+            hostnameEl.textContent = '加载中...';
+            statusEl.textContent = '获取数据';
+            statusEl.className = 'performance-status';
+            
+            // 重置饼图
+            updatePieChart('cpu', 0);
+            updatePieChart('mem', 0);
+            updatePieChart('disk', 0);
+            document.getElementById('cpuValue').textContent = '--%';
+            document.getElementById('memValue').textContent = '--%';
+            document.getElementById('diskValue').textContent = '-- MB/s';
+            
+            try {{
+                const response = await fetch('/api/performance?id=' + serverId);
+                const data = await response.json();
+                
+                if (data.success) {{
+                    hostnameEl.textContent = data.hostname;
+                    statusEl.textContent = data.status === 'running' ? '运行中' : '已停止';
+                    statusEl.className = 'performance-status ' + (data.status === 'running' ? 'running' : 'stopped');
+                    
+                    const perf = data.performance;
+                    
+                    updatePieChart('cpu', perf.cpu_usage);
+                    updatePieChart('mem', perf.mem_usage);
+                    
+                    // 使用原始字节值动态显示单位
+                    const diskIoBytes = perf.disk_io_bytes || 0;
+                    const diskIoMb = diskIoBytes / (1024 * 1024);
+                    let diskIoDisplay;
+                    if (diskIoMb >= 1) {{
+                        diskIoDisplay = diskIoMb.toFixed(1) + ' MB/s';
+                    }} else if (diskIoBytes >= 1024) {{
+                        const diskIoKb = diskIoBytes / 1024;
+                        diskIoDisplay = diskIoKb.toFixed(1) + ' KB/s';
+                    }} else if (diskIoBytes > 0) {{
+                        diskIoDisplay = diskIoBytes.toFixed(0) + ' B/s';
+                    }} else {{
+                        diskIoDisplay = '0 KB/s';
+                    }}
+                    // 饼图百分比：基于 MB/s 值，假设 100MB/s 为100%
+                    const diskIoPercent = Math.min(diskIoMb / 100 * 100, 100);
+                    updatePieChart('disk', diskIoPercent);
+                    
+                    document.getElementById('cpuValue').textContent = perf.cpu_usage.toFixed(1) + '%';
+                    document.getElementById('memValue').textContent = perf.mem_usage.toFixed(1) + '% (' + perf.mem_used.toFixed(1) + '/' + perf.mem_total.toFixed(1) + ' GB)';
+                    document.getElementById('diskValue').textContent = diskIoDisplay;
+                    
+                    // 后台预加载日志（如果缓存中没有），为AI诊断做准备
+                    if (!logsCache[serverId]) {{
+                        preloadLogs(serverId);
+                    }}
+                }} else {{
+                    hostnameEl.textContent = '获取失败';
+                    statusEl.textContent = data.error || '未知错误';
+                    statusEl.className = 'performance-status stopped';
+                }}
+            }} catch (err) {{
+                hostnameEl.textContent = '请求失败';
+                statusEl.textContent = err.message;
+                statusEl.className = 'performance-status stopped';
+            }}
+        }}
+        
+        // 刷新按钮事件
+        document.getElementById('perfRefreshBtn').addEventListener('click', function() {{
+            if (currentPerfServerId) {{
+                showPerformance(currentPerfServerId, null);
+            }}
+        }});
+        
+        // 关闭按钮事件
+        document.getElementById('perfClearBtn').addEventListener('click', function() {{
+            const panel = document.getElementById('performancePanel');
+            const tabLabel = document.getElementById('perfTabLabel');
+            panel.classList.remove('active');
+            tabLabel.classList.remove('active');
+            currentPerfServerId = null;
+            // 关闭 AI 诊断对话框
+            document.getElementById('aiDiagnosisDialog').classList.remove('active');
+        }});
+        
+        // AI 诊断按钮事件
+        document.getElementById('perfAiDiagnosisBtn').addEventListener('click', async function() {{
+            if (!currentPerfServerId) return;
+            
+            const dialog = document.getElementById('aiDiagnosisDialog');
+            const content = document.getElementById('aiDiagnosisContent');
+            const btn = document.getElementById('perfAiDiagnosisBtn');
+            
+            // 显示对话框
+            dialog.classList.add('active');
+            btn.disabled = true;
+            
+            // 显示统一的分析提示
+            content.innerHTML = '<span style="color:#666;">正在调用大模型分析日志...</span><span class="typing-cursor"></span>';
+            
+            try {{
+                // 调用 AI 诊断 API（流式响应）
+                const response = await fetch('/api/ai_diagnosis?id=' + currentPerfServerId);
+                
+                if (!response.ok) {{
+                    content.innerHTML = '<span style="color:#f44336;">获取诊断失败：' + response.statusText + '</span>';
+                    btn.disabled = false;
+                    return;
+                }}
+                
+                content.innerHTML = '<span class="typing-cursor"></span>';
+                let currentText = '';
+                
+                // 获取 reader 进行流式读取
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                
+                while (true) {{
+                    const {{ done, value }} = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value, {{ stream: true }});
+                    currentText += chunk;
+                    
+                    // 使用 Markdown 渲染
+                    const displayText = renderMarkdown(currentText);
+                    content.innerHTML = displayText + '<span class="typing-cursor"></span>';
+                    
+                    // 自动滚动到底部
+                    content.scrollTop = content.scrollHeight;
+                }}
+                
+                // 移除光标，最终渲染
+                content.innerHTML = renderMarkdown(currentText);
+                
+            }} catch (err) {{
+                content.innerHTML = '<span style="color:#f44336;">诊断请求失败：' + err.message + '</span>';
+            }} finally {{
+                btn.disabled = false;
+            }}
+        }});
+        
+        // 收起AI诊断对话框
+        document.getElementById('aiDiagnosisCollapse').addEventListener('click', function() {{
+            document.getElementById('aiDiagnosisDialog').classList.remove('active');
+        }});
+        
+        // 更新饼图
+        function updatePieChart(type, percentage) {{
+            const chart = document.querySelector('.pie-chart.' + type + ' .pie-fill');
+            if (!chart) return;
+            
+            // 圆的周长 = 2 * PI * r = 2 * 3.14159 * 40 ≈ 251.2
+            const circumference = 251.2;
+            const filled = (percentage / 100) * circumference;
+            
+            chart.style.strokeDasharray = filled + ' ' + circumference;
         }}
     </script>
 </body>

@@ -14,7 +14,7 @@ def load_config():
         "proxmox": {
             "host": "192.168.100.160",
             "user": "root@pam",
-            "password": "xxxx",
+            "password": "xxx",
             "verify_ssl": False
         }
     }
@@ -31,7 +31,7 @@ CONFIG = load_config()
 PROXMOX_CONFIG = CONFIG.get('proxmox', {})
 PROXMOX_HOST = PROXMOX_CONFIG.get('host', '192.168.100.160')
 PROXMOX_USER = PROXMOX_CONFIG.get('user', 'root@pam')
-PROXMOX_PASSWORD = PROXMOX_CONFIG.get('password', 'xxxx')
+PROXMOX_PASSWORD = PROXMOX_CONFIG.get('password', 'xxx')
 PROXMOX_VERIFY_SSL = PROXMOX_CONFIG.get('verify_ssl', False)
 
 # DeepSeek API 配置
@@ -2595,11 +2595,12 @@ class Handler(BaseHTTPRequestHandler):
         role_display = '管理员' if is_admin else '访客'
         role_class = 'role-admin' if is_admin else 'role-viewer'
 
+        # 构建物理机到虚拟机的映射（在if外定义，确保变量始终存在）
+        physical_servers = [s for s in servers if s['type'] == 'physical']
+        virtual_servers = [s for s in servers if s['type'] == 'virtual']
+        rows = []
+
         if servers:
-            rows = []
-            # 构建物理机到虚拟机的映射
-            physical_servers = [s for s in servers if s['type'] == 'physical']
-            virtual_servers = [s for s in servers if s['type'] == 'virtual']
             
             # 从 Proxmox API 获取虚拟机节点映射
             proxmox_vm_mapping = get_proxmox_vm_node_mapping()
@@ -4867,13 +4868,27 @@ if __name__ == '__main__':
     if not os.path.exists(USERS_FILE):
         save_users({'admin': {'password': '123456', 'role': 'admin'}})
     
+    # 从环境变量读取配置，支持内网部署自定义
+    port = int(os.environ.get('PORT', '8080'))
+    host = os.environ.get('HOST', '0.0.0.0')  # 默认绑定所有接口，支持内网访问
+    
     print('=' * 50)
     print('服务器智能管理系统 v2.0')
     print('=' * 50)
-    print('访问地址: http://127.0.0.1:5000')
+    print(f'访问地址: http://{host}:{port}')
+    if host == '0.0.0.0':
+        print('         http://127.0.0.1:' + str(port))
     print('=' * 50)
     print('按 Ctrl+C 停止服务器')
     print('=' * 50)
     
-    server = HTTPServer(('127.0.0.1', 5000), Handler)
-    server.serve_forever()
+    try:
+        server = HTTPServer((host, port), Handler)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print('\n服务器已停止')
+    except Exception as e:
+        print(f'\n启动失败: {e}')
+        print('请检查端口是否被占用，或尝试设置其他端口:')
+        print(f'  set PORT=8081')
+        print(f'  python server_v2.py')

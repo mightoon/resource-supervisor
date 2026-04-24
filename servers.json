@@ -1,0 +1,82 @@
+{
+  "servers": [
+    {
+      "id": 1,
+      "hostname": "infra",
+      "type": "virtual",
+      "purpose": "基础设施服务器",
+      "purpose_detail": "    - 安全管控平台\r\n    - 代码管理，版本管理 （gitlab）\r\n    - CICD （建议用jenkins）\r\n    - 关系型数据库 (mySQL)\r\n    - 对象存储 (minio)\r\n    - 半结构化数据库 (ES + Kibana)\r\n    。。。。。(后续添加)",
+      "ip": "192.168.100.153",
+      "cpu": "16",
+      "mem": "32GB",
+      "disk": "10TB",
+      "gpu_count": 0,
+      "assigned_gpus": [],
+      "user": "管理员"
+    },
+    {
+      "id": 2,
+      "hostname": "ming",
+      "type": "virtual",
+      "purpose": "个人开发虚机",
+      "purpose_detail": "",
+      "ip": "192.168.100.242",
+      "cpu": "16",
+      "mem": "20GB",
+      "disk": "500GB",
+      "gpu_count": 4,
+      "assigned_gpus": [
+        1,
+        2,
+        3,
+        7
+      ],
+      "user": "童铭"
+    },
+    {
+      "id": 3,
+      "hostname": "alg",
+      "type": "virtual",
+      "purpose": "AI服务器",
+      "purpose_detail": "    - vLLM，ollama等推理框架\r\n    - 本地大模型及相关应用\r\n    - Dify等编排类应用\r\n    - 向量数据库（milvus）\r\n    - 图数据库（neo4j）\r\n    - AI管理平台 (数派)",
+      "ip": "192.168.100.246",
+      "cpu": "32",
+      "mem": "64GB",
+      "disk": "4TB",
+      "gpu_count": 2,
+      "assigned_gpus": [
+        5,
+        6
+      ],
+      "user": "算法组"
+    },
+    {
+      "id": 4,
+      "hostname": "cdta",
+      "type": "physical",
+      "purpose": "Hypervisor 服务器",
+      "purpose_detail": "    - proxmox 提供虚拟化\r\n    - 提供 NFS 文件服务\r\n           - 可控读写：模型权重文件、docker images等\r\n           - 读写：个人文件，非密项目文件等",
+      "ip": "192.168.100.160",
+      "cpu": "128",
+      "mem": "512GB",
+      "disk": "37TB",
+      "gpu_count": 0,
+      "assigned_gpus": [],
+      "user": "管理员"
+    },
+    {
+      "id": 5,
+      "hostname": "cpu-server",
+      "type": "virtual",
+      "purpose": "公用CPU服务器",
+      "purpose_detail": "",
+      "ip": "192.168.100.245",
+      "cpu": "16",
+      "mem": "32GB",
+      "disk": "4TB",
+      "gpu_count": 0,
+      "assigned_gpus": [],
+      "user": "公共"
+    }
+  ]
+}

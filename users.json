@@ -1,0 +1,10 @@
+{
+  "admin": {
+    "password": "123456",
+    "role": "admin"
+  },
+  "ming": {
+    "password": "123456",
+    "role": "viewer"
+  }
+}

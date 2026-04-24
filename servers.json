@@ -41,9 +41,10 @@
       "disk": "50TB",
       "gpu_count": 0,
       "assigned_gpus": [],
-      "user": "兰家龙",
+      "user": "xxx",
       "parent_host": "cdta",
-      "proxmox_vmid": 112
+      "proxmox_vmid": 112,
+      "reg_type": "auto"
     },
     {
       "id": 10,
@@ -75,14 +76,14 @@
         2,
         3
       ],
-      "user": "胡碟",
-      "reg_type": "manual",
+      "user": "xxxx",
+      "reg_type": "auto",
       "parent_host": "cdta",
       "proxmox_vmid": 104
     },
     {
       "id": 13,
-      "hostname": "ming",
+      "hostname": "xxxx",
       "type": "virtual",
       "purpose": "个人开发虚机",
       "purpose_detail": "外网大模型部署",
@@ -97,14 +98,14 @@
         6,
         7
       ],
-      "user": "童铭",
-      "reg_type": "manual",
+      "user": "xxxxx",
+      "reg_type": "auto",
       "parent_host": "cdta",
       "proxmox_vmid": 105
     },
     {
       "id": 15,
-      "hostname": "qingguanwen",
+      "hostname": "xxxx",
       "type": "virtual",
       "purpose": "个人开发虚机",
       "purpose_detail": "",
@@ -114,14 +115,14 @@
       "disk": "500GB",
       "gpu_count": 0,
       "assigned_gpus": [],
-      "user": "秦冠文",
-      "reg_type": "manual",
+      "user": "xxxx",
+      "reg_type": "auto",
       "parent_host": "cdta",
       "proxmox_vmid": 117
     },
     {
       "id": 16,
-      "hostname": "LJL",
+      "hostname": "xxxx",
       "type": "virtual",
       "purpose": "个人开发虚机",
       "purpose_detail": "",
@@ -131,8 +132,8 @@
       "disk": "500GB",
       "gpu_count": 0,
       "assigned_gpus": [],
-      "user": "兰家龙",
-      "reg_type": "manual",
+      "user": "xxxx",
+      "reg_type": "auto",
       "parent_host": "cdta",
       "proxmox_vmid": 114
     },
@@ -148,7 +149,7 @@
       "disk": "10TB",
       "gpu_count": 4,
       "assigned_gpus": [],
-      "user": "童铭",
+      "user": "xxxx",
       "reg_type": "manual"
     },
     {
@@ -163,10 +164,10 @@
       "disk": "500GB",
       "gpu_count": 2,
       "assigned_gpus": [
-        2,
-        3
+        3,
+        4
       ],
-      "user": "兰家龙",
+      "user": "xxxx",
       "reg_type": "manual",
       "parent_host": "test-manu"
     },
@@ -197,14 +198,14 @@
       "disk": "33GB",
       "gpu_count": 0,
       "assigned_gpus": [],
-      "user": "兰家龙",
+      "user": "xxxxx",
       "reg_type": "manual",
       "ssh_verified": false,
       "parent_host": "test-manu"
     },
     {
       "id": 22,
-      "hostname": "fzj",
+      "hostname": "xxxx",
       "type": "virtual",
       "purpose": "个人开发虚机",
       "purpose_detail": "",
@@ -216,7 +217,7 @@
       "assigned_gpus": [
         8
       ],
-      "user": "范振军",
+      "user": "xxxxx",
       "reg_type": "auto",
       "ssh_verified": true,
       "parent_host": "cdta",
@@ -234,11 +235,11 @@
       "disk": "500GB",
       "gpu_count": 0,
       "assigned_gpus": [],
-      "user": "杨茗迪",
+      "user": "xxxxx",
       "reg_type": "manual",
       "ssh_verified": true,
       "ssh_user": "cdta",
-      "ssh_password": "cdta@123",
+      "ssh_password": "xxxxx",
       "parent_host": "test-manu"
     }
   ]

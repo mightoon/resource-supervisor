@@ -2,10 +2,29 @@
   "proxmox": {
     "host": "192.168.100.160",
     "user": "root@pam",
-    "password": "xxxxxx",
+    "password": "xxxxx",
     "verify_ssl": false
   },
   "deepseek": {
-    "api_key_base64": "c2stNxxxxxxxxxxxxxxxxx"
-  }
+    "api_key_base64": "c2stxxxxxxx"
+  },
+  "models": [
+    {
+      "id": "679b663d",
+      "name": "deepseek",
+      "model": "deepseek-chat",
+      "api_key": "c2stNGQxxxxxx",
+      "base_url": "https://api.deepseek.com",
+      "type": "public"
+    },
+    {
+      "id": "ebbf8835",
+      "name": "qwen35",
+      "model": "qwen35-35b",
+      "api_key": "",
+      "base_url": "http://192.168.100.242:10122/v1",
+      "type": "local"
+    }
+  ],
+  "current_model": "679b663d"
 }

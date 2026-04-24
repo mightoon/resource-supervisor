@@ -62,8 +62,146 @@ sessions = {}
 # 格式: {ip: {'read_sectors': int, 'write_sectors': int, 'timestamp': float}}
 diskstats_cache = {}
 
+def get_current_model_config():
+    """获取当前选中的模型配置"""
+    config = load_config()
+    current_model_id = config.get('current_model', '')
+    models = config.get('models', [])
+    
+    for model in models:
+        if model.get('id') == current_model_id:
+            # 解码api_key
+            api_key = ''
+            if model.get('api_key'):
+                try:
+                    api_key = base64.b64decode(model['api_key']).decode('utf-8').strip()
+                except:
+                    pass
+            return {
+                'id': model.get('id'),
+                'name': model.get('name'),
+                'model': model.get('model'),
+                'base_url': model.get('base_url'),
+                'api_key': api_key,
+                'type': model.get('type', 'public')
+            }
+    
+    # 默认使用deepseek配置（兼容旧版本）
+    return {
+        'id': 'default',
+        'name': 'DeepSeek',
+        'model': 'deepseek-chat',
+        'base_url': 'https://api.deepseek.com',
+        'api_key': DEEPSEEK_API_KEY or '',
+        'type': 'public'
+    }
+
+def test_model_connection(base_url, model, api_key, model_type='public'):
+    """测试模型连接是否可用
+    
+    通过发送一个简单的chat completion请求来验证模型可用性
+    Args:
+        base_url: API基础URL
+        model: 模型名称
+        api_key: API密钥（本地模型可为空）
+        model_type: 模型类型，'public'或'local'
+    返回: (success: bool, error_msg: str)
+    """
+    import ssl
+    import urllib.request
+    import urllib.error
+    
+    # 构建完整的API URL
+    # DeepSeek原生格式: /chat/completions (base_url不含/v1)
+    # OpenAI兼容格式: /v1/chat/completions (base_url含/v1) 或 /chat/completions
+    base = base_url.rstrip('/')
+    
+    # 智能判断URL格式
+    if 'deepseek' in base and '/v1' not in base:
+        # DeepSeek原生API: https://api.deepseek.com/chat/completions
+        chat_url = base + '/chat/completions'
+    elif base.endswith('/v1'):
+        # 用户已提供/v1后缀: http://host:port/v1/chat/completions
+        chat_url = base + '/chat/completions'
+    else:
+        # OpenAI兼容标准格式: base_url + /v1/chat/completions
+        chat_url = base + '/v1/chat/completions'
+    
+    print(f"[验证模型] URL: {chat_url}, Model: {model}, Type: {model_type}, API Key长度: {len(api_key) if api_key else 0}")
+    
+    # 检查API Key（仅公共模型需要）
+    if model_type == 'public' and not api_key:
+        return False, "公共模型需要配置 API Key"
+    
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Hi"}],
+        "stream": False,
+        "max_tokens": 5
+    }
+    
+    # 对于 Qwen 模型，根据版本使用不同方式关闭 thinking 模式
+    model_lower = model.lower()
+    if 'qwen' in model_lower:
+        # Qwen3.5 使用 chat_template_kwargs
+        if 'qwen3.5' in model_lower or 'qwen35' in model_lower:
+            payload["chat_template_kwargs"] = {
+                "enable_thinking": False,
+                "thinking": False
+            }
+        # Qwen3 和 Qwen2.5 尝试使用顶层参数
+        elif 'qwen3' in model_lower or 'qwen2.5' in model_lower or 'qwen25' in model_lower:
+            payload["enable_thinking"] = False
+            payload["thinking"] = False
+    
+    headers = {
+        "Content-Type": "application/json"
+    }
+    
+    # 只有提供了API Key才添加到请求头（本地模型可能没有）
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    
+    data = json.dumps(payload).encode('utf-8')
+    
+    req = urllib.request.Request(
+        chat_url,
+        data=data,
+        headers=headers,
+        method='POST'
+    )
+    
+    ssl_context = ssl.create_default_context()
+    
+    try:
+        with urllib.request.urlopen(req, context=ssl_context, timeout=10) as response:
+            print(f"[验证模型] 成功: HTTP {response.status}")
+            return response.status == 200, None
+    except urllib.error.HTTPError as e:
+        error_msg = f"HTTP {e.code}: {e.reason}"
+        try:
+            body = e.read().decode('utf-8')
+            print(f"[验证模型] HTTP错误: {error_msg}, 响应: {body}")
+        except:
+            print(f"[验证模型] HTTP错误: {error_msg}")
+        if e.code == 401:
+            error_msg = "API Key 无效或已过期"
+        elif e.code == 404:
+            error_msg = "模型不存在或URL路径错误"
+        elif e.code == 429:
+            error_msg = "请求过于频繁，请稍后再试"
+        return False, error_msg
+    except urllib.error.URLError as e:
+        error_msg = f"无法连接到服务器: {e.reason}"
+        print(f"[验证模型] {error_msg}")
+        return False, error_msg
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[验证模型] 异常: {error_msg}")
+        return False, error_msg
+
 def deepseek_chat_stream(messages):
-    """调用 DeepSeek API 进行流式对话
+    """调用当前选中的模型API进行流式对话
     
     Args:
         messages: 消息列表，格式 [{"role": "system"/"user"/"assistant", "content": "..."}]
@@ -71,33 +209,66 @@ def deepseek_chat_stream(messages):
     Yields:
         流式返回的文本片段
     """
-    if not DEEPSEEK_API_KEY:
-        yield "[错误: DeepSeek API key 未配置]"
+    # 获取当前模型配置
+    model_config = get_current_model_config()
+    api_key = model_config.get('api_key', '')
+    
+    if not api_key and model_config.get('type') == 'public':
+        yield "[错误: API key 未配置]"
         return
     
     try:
         import ssl
         import urllib.request
         
-        url = "https://api.deepseek.com/chat/completions"
+        base_url = model_config.get('base_url', 'https://api.deepseek.com')
+        base = base_url.rstrip('/')
+        
+        # 智能判断URL格式（与test_model_connection保持一致）
+        if 'deepseek' in base and '/v1' not in base:
+            # DeepSeek原生API
+            chat_url = base + '/chat/completions'
+        elif base.endswith('/v1'):
+            # 用户已提供/v1后缀
+            chat_url = base + '/chat/completions'
+        else:
+            # OpenAI兼容标准格式
+            chat_url = base + '/v1/chat/completions'
+        
+        model_name = model_config.get('model', 'deepseek-chat')
         
         payload = {
-            "model": "deepseek-chat",
+            "model": model_name,
             "messages": messages,
             "stream": True,
-            "temperature": 0.7,
-            "max_tokens": 2048
+            "temperature": 0.7
+            # 不设置 max_tokens，让模型自行决定输出长度，避免截断
         }
+        
+        # 对于 Qwen 模型，根据版本使用不同方式关闭 thinking 模式
+        model_name_lower = model_name.lower()
+        if 'qwen' in model_name_lower:
+            # Qwen3.5 使用 chat_template_kwargs
+            if 'qwen3.5' in model_name_lower or 'qwen35' in model_name_lower:
+                payload["chat_template_kwargs"] = {
+                    "enable_thinking": False,
+                    "thinking": False
+                }
+            # Qwen3 和 Qwen2.5 尝试使用顶层参数（某些部署方式支持）
+            elif 'qwen3' in model_name_lower or 'qwen2.5' in model_name_lower or 'qwen25' in model_name_lower:
+                # 尝试使用额外参数关闭 thinking（部分 vLLM/SGLang 部署支持）
+                payload["enable_thinking"] = False
+                payload["thinking"] = False
         
         headers = {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+            "Authorization": f"Bearer {api_key}"
         }
         
         data = json.dumps(payload).encode('utf-8')
         
         req = urllib.request.Request(
-            url,
+            chat_url,
             data=data,
             headers=headers,
             method='POST'
@@ -125,7 +296,8 @@ def deepseek_chat_stream(messages):
                         continue
                         
     except Exception as e:
-        yield f"[DeepSeek API 调用错误: {str(e)}]"
+        model_name = model_config.get('name', '未知模型')
+        yield f"[{model_name} API 调用错误: {str(e)}]"
 
 def build_diagnosis_prompt(perf_data, logs, server_info):
     """构建诊断提示词 - 深入分析日志中的错误和异常"""
@@ -186,12 +358,14 @@ def build_diagnosis_prompt(perf_data, logs, server_info):
 - 维护建议: [长期维护建议]
 
 ### 输出格式要求
+- **必须使用简体中文（Chinese）回复，禁止输出英文**
 - 使用 ## 作为一级标题、### 作为二级标题
 - 每个问题使用 **粗体** 标记问题类型和关键信息
 - 使用 - 标记列表项
 - 如有命令或代码，使用 ``` 代码块
 
-**注意**：
+**重要提示**：
+- **无论日志内容是什么语言，你的所有回复必须用简体中文**
 - 不要描述正常运行的情况
 - 如果确实没有问题，直接回复"日志分析未发现问题，系统运行正常"
 - 分析问题要深入具体，不要泛泛而谈"""
@@ -626,6 +800,210 @@ def get_proxmox_node_performance(node_name):
     except Exception as e:
         return None, f"Proxmox获取节点性能数据失败: {str(e)}"
 
+def get_proxmox_logs(node_name, vmid=None, vm_type='qemu', lines=100):
+    """通过Proxmox API获取服务器日志
+    
+    Args:
+        node_name: Proxmox节点名称
+        vmid: 虚拟机ID (如果是物理节点则为None)
+        vm_type: 虚拟机类型 ('qemu' 或 'lxc')
+        lines: 获取的日志行数
+    
+    Returns:
+        (logs_str, error_str): 日志内容和错误信息
+    """
+    print(f"[DEBUG] get_proxmox_logs called: node={node_name}, vmid={vmid}, vm_type={vm_type}, lines={lines}")
+    
+    if not PROXMOX_AVAILABLE:
+        print(f"[DEBUG] proxmoxer模块未安装")
+        return None, "Proxmox API 不可用 (proxmoxer模块未安装)"
+    
+    try:
+        proxmox = get_proxmox_client()
+        if not proxmox:
+            print(f"[DEBUG] Proxmox连接失败")
+            return None, "Proxmox连接失败"
+        
+        print(f"[DEBUG] Proxmox客户端创建成功")
+        logs = []
+        
+        if vmid is None:
+            # 获取物理节点的系统日志
+            print(f"[DEBUG] 获取物理节点 {node_name} 的syslog")
+            try:
+                syslog_entries = proxmox.nodes(node_name).syslog.get(limit=lines)
+                print(f"[DEBUG] 获取到 {len(syslog_entries)} 条syslog记录")
+                for entry in syslog_entries:
+                    time_str = entry.get('time', '')
+                    msg = entry.get('msg', '')
+                    prio = entry.get('prio', '')
+                    logs.append(f"[{time_str}] [{prio}] {msg}")
+            except Exception as e:
+                print(f"[DEBUG] 获取节点syslog失败: {str(e)}")
+                return None, f"获取节点syslog失败: {str(e)}"
+        else:
+            # 获取虚拟机/容器的日志
+            print(f"[DEBUG] 获取 {vm_type} 虚拟机/容器 {vmid} 的日志")
+            try:
+                if vm_type == 'lxc':
+                    # LXC容器有专门的log端点
+                    print(f"[DEBUG] 调用LXC log API: nodes/{node_name}/lxc/{vmid}/log")
+                    log_entries = proxmox.nodes(node_name).lxc(vmid).log.get(limit=lines)
+                    print(f"[DEBUG] 获取到 {len(log_entries)} 条LXC日志记录")
+                    for entry in log_entries:
+                        time_str = entry.get('t', entry.get('time', ''))
+                        msg = entry.get('msg', '')
+                        logs.append(f"[{time_str}] {msg}")
+                else:
+                    # QEMU虚拟机：获取任务历史作为日志，同时获取节点日志
+                    print(f"[DEBUG] QEMU VM: 尝试获取任务历史和节点日志")
+                    vm_id_str = str(vmid)
+                    
+                    # 1. 获取VM状态信息
+                    try:
+                        print(f"[DEBUG] 获取VM {vmid} 状态")
+                        vm_status = proxmox.nodes(node_name).qemu(vmid).status.current.get()
+                        print(f"[DEBUG] VM状态: {vm_status}")
+                        status_info = f"VM状态: {vm_status.get('qmpstatus', vm_status.get('status', 'unknown'))}, "
+                        status_info += f"CPU: {vm_status.get('cpu', 0):.2f}%, "
+                        maxmem_gb = vm_status.get('maxmem', 0) / (1024**3)
+                        mem_gb = vm_status.get('mem', 0) / (1024**3)
+                        status_info += f"内存: {mem_gb:.2f}GB / {maxmem_gb:.2f}GB, "
+                        status_info += f"磁盘读: {vm_status.get('diskread', 0)} bytes, 写: {vm_status.get('diskwrite', 0)} bytes"
+                        logs.append(f"[当前状态] {status_info}")
+                    except Exception as e:
+                        print(f"[DEBUG] 获取VM状态失败: {str(e)}")
+                        logs.append(f"[当前状态] 无法获取: {str(e)}")
+                    
+                    # 2. 获取VM配置信息
+                    try:
+                        print(f"[DEBUG] 获取VM {vmid} 配置")
+                        vm_config = proxmox.nodes(node_name).qemu(vmid).config.get()
+                        print(f"[DEBUG] VM配置获取成功")
+                        cores = vm_config.get('cores', '未知')
+                        memory = vm_config.get('memory', '未知')
+                        logs.append(f"[VM配置] CPU核心数: {cores}, 内存: {memory}MB")
+                    except Exception as e:
+                        print(f"[DEBUG] 获取VM配置失败: {str(e)}")
+                    
+                    # 3. 获取VM任务历史（扩大搜索范围）
+                    try:
+                        print(f"[DEBUG] 获取VM {vmid} 任务历史")
+                        # 获取更多任务记录
+                        all_tasks = proxmox.nodes(node_name).tasks.get(limit=lines*5)
+                        print(f"[DEBUG] 获取到 {len(all_tasks)} 条任务记录")
+                        vm_tasks = []
+                        for task in all_tasks:
+                            # 多种方式匹配VM相关任务
+                            task_id = task.get('id', '')
+                            task_type = task.get('type', '')
+                            task_user = task.get('user', '')
+                            # 匹配 vmid、upid 中包含 vmid、或者类型包含 vm
+                            if (vm_id_str in task_id or 
+                                vm_id_str in task_type or 
+                                f'qemu-{vm_id_str}' in str(task) or
+                                (task_type and 'qm' in task_type.lower())):
+                                vm_tasks.append(task)
+                        
+                        print(f"[DEBUG] 过滤后得到 {len(vm_tasks)} 条VM相关任务")
+                        if vm_tasks:
+                            logs.append(f"\n[VM任务历史 - 最近{len(vm_tasks)}条]")
+                            for task in vm_tasks[:lines]:
+                                start_time = task.get('starttime', '')
+                                status = task.get('status', '')
+                                task_type = task.get('type', '')
+                                user = task.get('user', '')
+                                task_id = task.get('id', '')
+                                logs.append(f"[{start_time}] {task_type} (ID:{task_id}) 状态:{status} 用户:{user}")
+                        else:
+                            logs.append(f"\n[VM任务历史] 暂无VM {vmid} 相关任务记录")
+                    except Exception as e:
+                        print(f"[DEBUG] 获取任务历史失败: {str(e)}")
+                        logs.append(f"[VM任务历史] 无法获取: {str(e)}")
+                    
+                    # 4. 获取VM所在节点的系统日志（只保留与当前VM相关的条目）
+                    try:
+                        print(f"[DEBUG] 获取节点 {node_name} 的系统日志并过滤VM {vmid} 相关条目")
+                        syslog_entries = proxmox.nodes(node_name).syslog.get(limit=lines*3)
+                        print(f"[DEBUG] 获取到 {len(syslog_entries)} 条节点syslog记录，开始过滤")
+                        vm_syslog_entries = []
+                        vm_id_str = str(vmid)
+                        # 用于匹配其他VMID的正则，用于排除其他VM的日志
+                        other_vm_patterns = []
+                        for i in range(100, 1000):  # 假设VMID范围在100-999
+                            if i != int(vmid):
+                                other_vm_patterns.append(f' {i} ')
+                                other_vm_patterns.append(f'/{i}/')
+                                other_vm_patterns.append(f'VM {i}')
+                                other_vm_patterns.append(f'vmid={i}')
+                        
+                        for entry in syslog_entries:
+                            msg = entry.get('msg', '')
+                            # 检查是否包含当前VMID
+                            is_current_vm = (vm_id_str in msg or 
+                                           f'VM {vm_id_str}' in msg or 
+                                           f'vmid={vm_id_str}' in msg or
+                                           f'qemu-{vm_id_str}' in msg or
+                                           f'/{vm_id_str}/' in msg)
+                            
+                            # 如果包含当前VMID，则进一步检查是否也包含其他VMID（排除混合日志）
+                            if is_current_vm:
+                                has_other_vm = False
+                                for pattern in other_vm_patterns:
+                                    if pattern in msg:
+                                        has_other_vm = True
+                                        break
+                                if not has_other_vm:
+                                    vm_syslog_entries.append(entry)
+                            # 也包含一些通用的非VM特定日志（如节点级别的警告/错误）
+                            elif any(keyword in msg.lower() for keyword in ['error', 'fail', 'warning', 'critical', 'fatal']):
+                                # 确保这条通用日志不包含任何其他VMID
+                                has_any_vm = False
+                                for i in range(100, 1000):
+                                    if str(i) in msg and i != int(vmid):
+                                        has_any_vm = True
+                                        break
+                                if not has_any_vm:
+                                    vm_syslog_entries.append(entry)
+                        
+                        print(f"[DEBUG] 过滤后得到 {len(vm_syslog_entries)} 条VM {vmid} 相关的syslog记录")
+                        if vm_syslog_entries:
+                            logs.append(f"\n[VM系统日志 - 最近{min(len(vm_syslog_entries), lines)}条]")
+                            for entry in vm_syslog_entries[:lines]:
+                                time_str = entry.get('time', '')
+                                msg = entry.get('msg', '')
+                                prio = entry.get('prio', '')
+                                logs.append(f"[{time_str}] [{prio}] {msg}")
+                        else:
+                            logs.append(f"\n[VM系统日志] 暂无VM {vmid} 相关的系统日志")
+                    except Exception as e:
+                        print(f"[DEBUG] 获取节点syslog失败: {str(e)}")
+                        logs.append(f"[VM系统日志] 无法获取: {str(e)}")
+                        
+            except Exception as e:
+                print(f"[DEBUG] 获取{'容器' if vm_type=='lxc' else '虚拟机'}日志失败: {str(e)}")
+                return None, f"获取{'容器' if vm_type=='lxc' else '虚拟机'}日志失败: {str(e)}"
+        
+        # 组合日志内容
+        if not logs:
+            print(f"[DEBUG] 没有获取到日志记录")
+            return "暂无日志记录", None
+        
+        log_text = '\n'.join(logs)
+        print(f"[DEBUG] 日志总长度: {len(log_text)} 字符")
+        
+        # 截取日志内容（限制长度）
+        max_length = 50000
+        if len(log_text) > max_length:
+            log_text = log_text[-max_length:]
+            log_text = "[日志过长，仅显示最近部分]\n..." + log_text
+        
+        return log_text, None
+        
+    except Exception as e:
+        print(f"[DEBUG] Proxmox获取日志失败: {str(e)}")
+        return None, f"Proxmox获取日志失败: {str(e)}"
+
 def get_proxmox_client():
     """创建 Proxmox API 客户端"""
     if not PROXMOX_AVAILABLE:
@@ -950,17 +1328,27 @@ def get_node_info(node_name):
 CSS = """
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f7fa; min-height: 100vh; }
-.header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px 40px; display: flex; justify-content: space-between; align-items: center; }
+.header { background: linear-gradient(135deg, #2196F3 0%, #764ba2 100%); color: white; padding: 20px 40px; display: flex; justify-content: space-between; align-items: center; }
 .header h1 { font-size: 24px; }
+.user-menu { position: relative; display: inline-block; }
+.user-menu-trigger { display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 8px 16px; background: transparent; border-radius: 8px; transition: all 0.3s; }
+.user-menu-trigger:hover { background: transparent; }
+.user-menu-dropdown { display: none; position: absolute; right: 0; top: 100%; margin-top: 8px; background: white; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.15); min-width: 150px; z-index: 1000; overflow: hidden; }
+.user-menu-dropdown.active { display: block; }
+.user-menu-item { display: block; padding: 12px 16px; color: #333; text-decoration: none; font-size: 14px; transition: all 0.2s; border-bottom: 1px solid #f0f0f0; }
+.user-menu-item:last-child { border-bottom: none; }
+.user-menu-item:hover { background: #f5f5f5; color: #667eea; }
+.user-menu-item.admin-only { background: #e3f2fd; color: #1976d2; }
+.user-menu-item.admin-only:hover { background: #bbdefb; }
 .container { max-width: 1400px; margin: 0 auto; padding: 30px 40px; }
-.btn-add { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 14px 28px; border-radius: 10px; cursor: pointer; font-size: 15px; font-weight: 600; margin-right: 10px; }
-.btn-add:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4); }
-.btn-batch { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 14px 28px; border-radius: 10px; cursor: pointer; font-size: 15px; font-weight: 600; margin-right: 10px; }
-.btn-batch:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4); }
-.btn-batch-delete { background: #f44336; color: white; border: none; padding: 14px 28px; border-radius: 10px; cursor: pointer; font-size: 15px; font-weight: 600; margin-right: 10px; }
+.btn-add { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; margin-right: 8px; }
+.btn-add:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4); }
+.btn-batch { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; margin-right: 8px; }
+.btn-batch:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4); }
+.btn-batch-delete { background: #f44336; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; margin-right: 8px; }
 .btn-batch-delete:hover { background: #d32f2f; }
-.btn-add-vm { background: #4caf50; color: white; border: none; padding: 14px 28px; border-radius: 10px; cursor: pointer; font-size: 15px; font-weight: 600; margin-right: 10px; }
-.btn-add-vm:hover { background: #388e3c; }
+.btn-add-vm { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; margin-right: 8px; }
+.btn-add-vm:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4); }
 .btn-add-vm:disabled { background: #ccc; cursor: not-allowed; }
 .btn-batch:disabled, .btn-batch-delete:disabled { background: #ccc; cursor: not-allowed; }
 .vm-list { max-height: 400px; overflow-y: auto; }
@@ -1095,7 +1483,7 @@ textarea { resize: vertical; min-height: 80px; }
 /* 性能监控面板样式 */
 .performance-panel { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0, 0, 0, 0.05); margin-bottom: 25px; display: none; }
 .performance-panel.active { display: block; }
-.tab-label { display: none; padding: 10px 24px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border-radius: 10px 10px 0 0; font-size: 16px; font-weight: 600; margin-bottom: 0; }
+.tab-label { display: none; padding: 12px 30px; background: linear-gradient(135deg, #2196F3 0%, #1976D2 100%); color: white; border-radius: 10px 10px 0 0; font-size: 18px; font-weight: 600; margin-bottom: 0; }
 .tab-label.active { display: inline-block; }
 .tab-label.inventory-tab { display: inline-block; }
 .performance-header { display: flex; align-items: center; margin-bottom: 20px; padding-bottom: 15px; border-bottom: 1px solid #eee; }
@@ -1124,6 +1512,39 @@ textarea { resize: vertical; min-height: 80px; }
 .ai-diagnosis-content .typing-cursor { display: inline-block; width: 2px; height: 16px; background: #ff6b6b; animation: blink 1s infinite; margin-left: 2px; }
 @keyframes blink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
 .performance-charts { display: flex; justify-content: space-around; align-items: center; flex-wrap: wrap; gap: 30px; }
+/* 模型管理页面样式 */
+.models-container { max-width: 1000px; margin: 0 auto; padding: 30px; }
+.models-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+.models-header h2 { color: #333; font-size: 24px; }
+.model-card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 15px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); display: flex; align-items: center; gap: 15px; transition: all 0.3s; }
+.model-card:hover { box-shadow: 0 4px 20px rgba(0,0,0,0.12); }
+.model-card.selected { border: 2px solid #667eea; background: #f8f9ff; }
+.model-radio { width: 20px; height: 20px; cursor: pointer; }
+.model-info { flex: 1; }
+.model-name { font-weight: 600; font-size: 16px; color: #333; margin-bottom: 4px; }
+.model-details { font-size: 13px; color: #666; }
+.model-type { display: inline-block; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 500; margin-left: 10px; }
+.model-type-public { background: #e3f2fd; color: #1976d2; }
+.model-type-local { background: #e8f5e9; color: #2e7d32; }
+.model-actions { display: flex; gap: 10px; }
+.btn-model-test { background: #4caf50; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.btn-model-test:hover { background: #45a049; }
+.btn-model-delete { background: #f44336; color: white; border: none; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+.btn-model-delete:hover { background: #d32f2f; }
+.add-model-section { background: white; border-radius: 12px; padding: 25px; margin-top: 30px; box-shadow: 0 2px 10px rgba(0,0,0,0.08); }
+.add-model-section h3 { margin-bottom: 20px; color: #333; }
+.model-form-row { display: flex; gap: 20px; margin-bottom: 15px; flex-wrap: wrap; }
+.model-form-group { flex: 1; min-width: 200px; }
+.model-form-group label { display: block; margin-bottom: 6px; font-size: 14px; color: #555; font-weight: 500; }
+.model-form-group input, .model-form-group select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
+.model-form-group input:focus, .model-form-group select:focus { outline: none; border-color: #667eea; }
+.btn-add-model { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 600; }
+.btn-add-model:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4); }
+.model-tabs { display: flex; gap: 10px; margin-bottom: 20px; }
+.model-tab { padding: 10px 20px; border: none; background: #f0f0f0; border-radius: 6px; cursor: pointer; font-size: 14px; }
+.model-tab.active { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; }
+.back-link { color: #667eea; text-decoration: none; font-size: 14px; display: inline-flex; align-items: center; gap: 5px; margin-bottom: 20px; }
+.back-link:hover { text-decoration: underline; }
 .chart-container { display: flex; flex-direction: column; align-items: center; }
 .chart-label { margin-top: 10px; font-size: 14px; color: #666; font-weight: 500; }
 .chart-value { margin-top: 5px; font-size: 12px; color: #888; }
@@ -1137,7 +1558,7 @@ textarea { resize: vertical; min-height: 80px; }
 .pie-chart.mem .pie-fill { stroke: #764ba2; }
 .pie-chart.disk .pie-fill { stroke: #4caf50; }
 
-.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 25px; flex-wrap: wrap; gap: 10px; }
+.toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; flex-wrap: wrap; gap: 8px; }
 .batch-actions { display: none; }
 .batch-actions.active { display: flex; }
 .checkbox-col { width: 50px; text-align: center; }
@@ -1219,6 +1640,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
             else:
                 self.render_dashboard(session)
+
+        elif path == '/models':
+            # 模型管理页面（仅admin）
+            if not session:
+                self.send_response(302)
+                self.send_header('Location', '/login')
+                self.end_headers()
+            elif session.get('role') != 'admin':
+                self.send_response(403)
+                self.send_html('<h1>Forbidden</h1><p>只有管理员可以访问模型管理。</p><a href="/dashboard">返回</a>')
+            else:
+                self.render_models_page(session)
 
         elif path == '/logout':
             cookie = self.headers.get('Cookie', '')
@@ -1476,33 +1909,54 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_json({'success': False, 'error': '服务器不存在'})
                         return
                     
-                    # 只支持手动注册的服务器（通过SSH获取日志）
                     reg_type = server.get('reg_type', 'manual')
                     is_auto = reg_type == 'auto' or server.get('proxmox_vmid') is not None
                     
                     if is_auto:
-                        self.send_json({'success': False, 'error': '自动注册的服务器暂不支持日志获取'})
-                        return
-                    
-                    # 手动注册：通过SSH获取日志
-                    ssh_user = server.get('ssh_user')
-                    ssh_password = server.get('ssh_password')
-                    
-                    if not ssh_user or not ssh_password:
-                        self.send_json({'success': False, 'error': '没有存储SSH凭据，无法获取日志'})
-                        return
-                    
-                    ip = server['ip']
-                    logs, error = get_ssh_logs(ip, ssh_user, ssh_password, lines=100)
-                    
-                    if error:
-                        self.send_json({'success': False, 'error': error})
+                        # 自动注册的服务器：通过Proxmox API获取日志
+                        node_name = server.get('hostname', '')
+                        proxmox_vmid = server.get('proxmox_vmid')
+                        server_type = server.get('type', 'physical')
+                        
+                        # 对于虚拟机，需要通过映射找到其所在的物理节点
+                        if server_type == 'virtual' and proxmox_vmid:
+                            # 获取VM到节点的映射
+                            vm_mapping = get_proxmox_vm_node_mapping()
+                            node_name = vm_mapping.get(str(proxmox_vmid), node_name)
+                            vm_type = 'lxc' if 'lxc' in str(server.get('proxmox_type', '')).lower() else 'qemu'
+                            logs, error = get_proxmox_logs(node_name, proxmox_vmid, vm_type, lines=100)
+                        else:
+                            # 物理节点日志
+                            logs, error = get_proxmox_logs(node_name, None, 'qemu', lines=100)
+                        
+                        if error:
+                            self.send_json({'success': False, 'error': error})
+                        else:
+                            self.send_json({
+                                'success': True,
+                                'logs': logs,
+                                'hostname': server['hostname']
+                            })
                     else:
-                        self.send_json({
-                            'success': True,
-                            'logs': logs,
-                            'hostname': server['hostname']
-                        })
+                        # 手动注册：通过SSH获取日志
+                        ssh_user = server.get('ssh_user')
+                        ssh_password = server.get('ssh_password')
+                        
+                        if not ssh_user or not ssh_password:
+                            self.send_json({'success': False, 'error': '没有存储SSH凭据，无法获取日志'})
+                            return
+                        
+                        ip = server['ip']
+                        logs, error = get_ssh_logs(ip, ssh_user, ssh_password, lines=100)
+                        
+                        if error:
+                            self.send_json({'success': False, 'error': error})
+                        else:
+                            self.send_json({
+                                'success': True,
+                                'logs': logs,
+                                'hostname': server['hostname']
+                            })
         
         elif path == '/api/ai_diagnosis':
             # API: AI 流式诊断
@@ -1542,19 +1996,31 @@ class Handler(BaseHTTPRequestHandler):
                     if is_auto:
                         # 自动注册：通过Proxmox API获取
                         hostname = server['hostname']
+                        proxmox_vmid = server.get('proxmox_vmid')
+                        
                         if server['type'] == 'physical':
                             perf_data, error = get_proxmox_node_performance(hostname)
+                            # 物理节点日志
+                            logs, log_error = get_proxmox_logs(hostname, None, 'qemu', lines=100)
+                            if log_error:
+                                logs = f"获取日志失败: {log_error}"
                         else:
-                            vmid = server.get('proxmox_vmid')
-                            if vmid:
+                            # 虚拟机
+                            if proxmox_vmid:
                                 node_name = server.get('parent_host', '')
                                 if node_name:
-                                    perf_data, error = get_proxmox_vm_performance(node_name, vmid, 'qemu')
+                                    perf_data, error = get_proxmox_vm_performance(node_name, proxmox_vmid, 'qemu')
+                                    # 获取虚拟机日志
+                                    vm_type = 'lxc' if 'lxc' in str(server.get('proxmox_type', '')).lower() else 'qemu'
+                                    logs, log_error = get_proxmox_logs(node_name, proxmox_vmid, vm_type, lines=100)
+                                    if log_error:
+                                        logs = f"获取日志失败: {log_error}"
                                 else:
                                     error = '无法确定虚拟机所在节点'
+                                    logs = None
                             else:
                                 error = '虚拟机没有proxmox_vmid'
-                        logs = "自动注册的服务器暂不支持日志获取"
+                                logs = None
                     else:
                         # 手动注册：通过SSH获取
                         ssh_user = server.get('ssh_user')
@@ -1595,7 +2061,7 @@ class Handler(BaseHTTPRequestHandler):
                     
                     # 调用 DeepSeek API 并流式输出
                     messages = [
-                        {"role": "system", "content": "你是一位专业的服务器运维专家，擅长分析系统性能和日志。请用中文给出专业但易懂的诊断报告。"},
+                        {"role": "system", "content": "你是一位专业的服务器运维专家，擅长分析系统性能和日志。**无论输入是什么语言，你必须始终用简体中文（Chinese）回复**。请用中文给出专业但易懂的诊断报告。"},
                         {"role": "user", "content": prompt}
                     ]
                     
@@ -1605,6 +2071,16 @@ class Handler(BaseHTTPRequestHandler):
                             self.wfile.flush()
                     except Exception as e:
                         self.wfile.write(f"\n[流式输出中断: {str(e)}]".encode('utf-8'))
+        
+        elif path == '/api/models':
+            # API: 获取模型列表
+            if not session:
+                self.send_json({'success': False, 'error': '未登录'})
+            else:
+                config = load_config()
+                models = config.get('models', [])
+                current = config.get('current_model', '')
+                self.send_json({'success': True, 'models': models, 'current_model': current})
         
         else:
             self.send_html('<h1>404</h1>', 404)
@@ -1827,19 +2303,219 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_response(500)
                     self.send_html(f'<h1>Error</h1><p>{e}</p><a href="/dashboard">Back</a>')
 
+        # 模型管理API（使用JSON格式）
+        elif path == '/api/models/add':
+            if not session or session.get('role') != 'admin':
+                self.send_json({'success': False, 'error': '无权限'})
+            else:
+                try:
+                    import json
+                    # 使用已经读取的 body，不要重复读取 rfile
+                    if not body or not body.strip():
+                        self.send_json({'success': False, 'error': '请求体为空'})
+                        return
+                    
+                    data = json.loads(body)
+                    
+                    name = data.get('name', '').strip()
+                    model = data.get('model', '').strip()
+                    api_key = data.get('api_key', '').strip()
+                    base_url = data.get('base_url', '').strip()
+                    model_type = data.get('type', 'public')
+                    
+                    if not name or not model or not base_url:
+                        self.send_json({'success': False, 'error': '缺少必要参数'})
+                        return
+                    
+                    if model_type == 'public' and not api_key:
+                        self.send_json({'success': False, 'error': '公共模型需要API Key'})
+                        return
+                    
+                    # 先测试连接（添加模型时自动验证）
+                    success, error_msg = test_model_connection(base_url, model, api_key, model_type)
+                    if not success:
+                        self.send_json({'success': False, 'error': f'模型验证失败：{error_msg}'})
+                        return
+                    
+                    # 生成唯一ID
+                    model_id = str(uuid.uuid4())[:8]
+                    
+                    # 读取当前配置
+                    config = load_config()
+                    if 'models' not in config:
+                        config['models'] = []
+                    
+                    # 添加新模型（api_key用base64编码存储）
+                    new_model = {
+                        'id': model_id,
+                        'name': name,
+                        'model': model,
+                        'api_key': base64.b64encode(api_key.encode()).decode() if api_key else '',
+                        'base_url': base_url,
+                        'type': model_type
+                    }
+                    config['models'].append(new_model)
+                    
+                    # 如果是第一个模型，设为当前模型
+                    if len(config['models']) == 1:
+                        config['current_model'] = model_id
+                    
+                    # 保存配置
+                    with open('config.json', 'w', encoding='utf-8') as f:
+                        json.dump(config, f, ensure_ascii=False, indent=2)
+                    
+                    self.send_json({'success': True, 'model_id': model_id, 'message': '模型添加成功并已通过验证'})
+                except Exception as e:
+                    self.send_json({'success': False, 'error': str(e)})
+
+        elif path == '/api/models/delete':
+            if not session or session.get('role') != 'admin':
+                self.send_json({'success': False, 'error': '无权限'})
+            else:
+                try:
+                    import json
+                    # 使用已经读取的 body，不要重复读取 rfile
+                    if not body or not body.strip():
+                        self.send_json({'success': False, 'error': '请求体为空'})
+                        return
+                    
+                    data = json.loads(body)
+                    
+                    model_id = data.get('model_id')
+                    if not model_id:
+                        self.send_json({'success': False, 'error': '缺少模型ID'})
+                        return
+                    
+                    config = load_config()
+                    models = config.get('models', [])
+                    
+                    # 查找并删除
+                    for i, m in enumerate(models):
+                        if m.get('id') == model_id:
+                            models.pop(i)
+                            break
+                    
+                    config['models'] = models
+                    
+                    # 如果删除的是当前模型，重置当前模型
+                    if config.get('current_model') == model_id:
+                        config['current_model'] = models[0]['id'] if models else ''
+                    
+                    with open('config.json', 'w', encoding='utf-8') as f:
+                        json.dump(config, f, ensure_ascii=False, indent=2)
+                    
+                    self.send_json({'success': True})
+                except Exception as e:
+                    self.send_json({'success': False, 'error': str(e)})
+
+        elif path == '/api/models/select':
+            if not session or session.get('role') != 'admin':
+                self.send_json({'success': False, 'error': '无权限'})
+            else:
+                try:
+                    import json
+                    # 使用已经读取的 body，不要重复读取 rfile
+                    if not body or not body.strip():
+                        self.send_json({'success': False, 'error': '请求体为空'})
+                        return
+                    
+                    data = json.loads(body)
+                    
+                    model_id = data.get('model_id')
+                    if not model_id:
+                        self.send_json({'success': False, 'error': '缺少模型ID'})
+                        return
+                    
+                    config = load_config()
+                    models = config.get('models', [])
+                    
+                    # 验证模型存在
+                    found = any(m.get('id') == model_id for m in models)
+                    if not found:
+                        self.send_json({'success': False, 'error': '模型不存在'})
+                        return
+                    
+                    config['current_model'] = model_id
+                    
+                    with open('config.json', 'w', encoding='utf-8') as f:
+                        json.dump(config, f, ensure_ascii=False, indent=2)
+                    
+                    self.send_json({'success': True})
+                except Exception as e:
+                    self.send_json({'success': False, 'error': str(e)})
+
+        elif path == '/api/models/test':
+            if not session or session.get('role') != 'admin':
+                self.send_json({'success': False, 'error': '无权限'})
+            else:
+                try:
+                    import json
+                    # 使用已经读取的 body，不要重复读取 rfile
+                    if not body or not body.strip():
+                        self.send_json({'success': False, 'error': '请求体为空'})
+                        return
+                    
+                    data = json.loads(body)
+                    
+                    model_id = data.get('model_id')
+                    if not model_id:
+                        self.send_json({'success': False, 'error': '缺少模型ID'})
+                        return
+                    
+                    config = load_config()
+                    models = config.get('models', [])
+                    
+                    # 查找模型
+                    target_model = None
+                    for m in models:
+                        if m.get('id') == model_id:
+                            target_model = m
+                            break
+                    
+                    if not target_model:
+                        self.send_json({'success': False, 'error': '模型不存在'})
+                        return
+                    
+                    # 解码api_key
+                    api_key = ''
+                    raw_api_key = target_model.get('api_key', '')
+                    print(f"[模型验证] 原始api_key(base64): {raw_api_key[:20]}...")
+                    if raw_api_key:
+                        try:
+                            api_key = base64.b64decode(raw_api_key).decode('utf-8').strip()
+                            print(f"[模型验证] 解码后api_key: {api_key[:15]}...{api_key[-4:]}")
+                        except Exception as e:
+                            print(f"[模型验证] api_key解码失败: {e}")
+                            pass
+                    
+                    base_url = target_model.get('base_url', '')
+                    model = target_model.get('model', '')
+                    model_type = target_model.get('type', 'public')
+                    print(f"[模型验证] base_url: {base_url}, model: {model}, type: {model_type}")
+                    
+                    # 测试调用
+                    success, error_msg = test_model_connection(base_url, model, api_key, model_type)
+                    
+                    if success:
+                        self.send_json({'success': True})
+                    else:
+                        self.send_json({'success': False, 'error': error_msg or '无法连接到模型API'})
+                except Exception as e:
+                    self.send_json({'success': False, 'error': str(e)})
+
     def render_login(self, error_msg, success_msg):
         msg = error_msg or success_msg or ''
         html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>登录 - 服务器资源管理系统</title>
+    <title>登录 - 服务器智能管理系统</title>
     <style>{CSS}</style>
 </head>
 <body class="login-body">
     <div class="login-container">
-        <h1>服务器资源管理系统</h1>
-        <p class="login-subtitle">Server Resource Management System</p>
+        <h1>服务器智能管理系统</h1>
+        <p class="login-subtitle">Server Intelligent Management System</p>
         {msg}
         <form method="POST" action="/login">
             <div class="login-form-group">
@@ -1855,7 +2531,6 @@ class Handler(BaseHTTPRequestHandler):
         <div class="switch-mode">
             还没有账号？<a href="/register">立即注册</a>
         </div>
-        <div class="hint">默认账号: admin | 密码: 123456</div>
     </div>
 </body>
 </html>"""
@@ -1867,7 +2542,7 @@ class Handler(BaseHTTPRequestHandler):
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>注册 - 服务器资源管理系统</title>
+    <title>注册 - 服务器智能管理系统</title>
     <style>{CSS}</style>
 </head>
 <body class="login-body">
@@ -1959,7 +2634,7 @@ class Handler(BaseHTTPRequestHandler):
                     # 物理机GPU显示逻辑
                     gpu_count = s.get('gpu_count', 0)
                     if gpu_count == 0:
-                        gtags = '<span style="color:#888;">无GPU</span>'
+                        gtags = '<span style="color:#888;font-weight:600;">无GPU</span>'
                     elif has_children and physical_children:
                         # 有GPU且有虚拟机，计算空闲GPU数
                         children = physical_children.get(s['id'], [])
@@ -1967,10 +2642,14 @@ class Handler(BaseHTTPRequestHandler):
                         for vm in children:
                             assigned_gpu_count += len(vm.get('assigned_gpus', []))
                         free_gpu = gpu_count - assigned_gpu_count
-                        gtags = f'<span style="color:#2e7d32;font-weight:600;">尚有{free_gpu}卡空闲</span>'
+                        if free_gpu == 0:
+                            # GPU全部分配
+                            gtags = '<span style="color:#888;font-weight:600;">GPU已全分配</span>'
+                        else:
+                            gtags = f'<span style="color:#2e7d32;font-weight:600;">尚有{free_gpu}卡空闲</span>'
                     else:
                         # 有GPU但没有虚拟机
-                        gtags = '<span style="color:#1976d2;font-weight:600;">物理机使用</span>'
+                        gtags = '<span style="color:#2e7d32;font-weight:600;">物理机独享</span>'
                 else:
                     # 虚拟机：获取父物理机名称
                     parent = parent_hostname or s.get('parent_host', '未知')
@@ -1981,15 +2660,16 @@ class Handler(BaseHTTPRequestHandler):
                 # 获取注册方式（auto/manual），默认为manual
                 reg_type = s.get('reg_type', 'manual')
                 
-                # 判断是否为主机名添加下划线
-                # 自动注册（auto或有proxmox_vmid字段）始终添加下划线
-                # 手动注册（manual）只有通过了SSH验证才添加下划线
+                # 获取SSH验证状态，手动注册的服务器需要验证通过才能查看Server Insights
                 ssh_verified = s.get('ssh_verified', False)
-                is_auto = reg_type == 'auto' or s.get('proxmox_vmid') is not None
-                if is_auto or ssh_verified:
+                
+                # 只有自动注册的服务器，或手动注册且SSH验证通过的服务器才能点击
+                can_click = (reg_type == 'auto') or (reg_type == 'manual' and ssh_verified)
+                
+                if can_click:
                     hostname_display = f'<span class="clickable-hostname" style="text-decoration: underline; cursor: pointer; color: #667eea;" onclick="showPerformance({s["id"]}, event)">{s["hostname"]}</span>'
                 else:
-                    hostname_display = s['hostname']
+                    hostname_display = f'<span style="color: #666;">{s["hostname"]}</span>'
                 
                 if is_physical:
                     # 物理机：折叠按钮单独一列，存储注册方式
@@ -2086,16 +2766,16 @@ class Handler(BaseHTTPRequestHandler):
         checkbox_header = '<th class="checkbox-col"><input type="checkbox" id="selectAll" onclick="toggleSelectAll()"></th>' if is_admin else ''
         viewer_notice = '<div class="viewer-notice"><p>您当前以访客身份登录，仅可查看服务器信息，无法进行添加、修改或删除操作。</p></div>' if not is_admin else ''
         
-        add_button = '<button class="btn-add" id="btnRegisterPhysical" onclick="openNodeInputModal()" title="通过proxmox api自动添加物理机">+ 自动注册物理机</button>' if is_admin else ''
-        manual_add_button = '<button class="btn-add" id="btnManualAddPhysical" onclick="openManualAddModal()" style="background: linear-gradient(135deg, #42a5f5 0%, #1976d2 100%);">+ 手动注册物理机</button>' if is_admin else ''
+        add_button = '<button class="btn-add" id="btnRegisterPhysical" onclick="openNodeInputModal()" title="通过proxmox api自动添加物理机">自动注册物理机</button>' if is_admin else ''
+        manual_add_button = '<button class="btn-add" id="btnManualAddPhysical" onclick="openManualAddModal()">手动注册物理机</button>' if is_admin else ''
         batch_buttons = '''
             <div class="batch-actions" id="batchActions">
                 <button type="button" class="btn-batch" onclick="editSelected()">修改选中</button>
                 <button type="button" class="btn-batch-delete" onclick="deleteSelected()">删除选中</button>
             </div>
         ''' if is_admin else ''
-        auto_add_vm_button = '<button type="button" class="btn-add-vm" id="btnAutoAddVm" onclick="addVmToHost()" style="display:none; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">自动添加虚拟机</button>' if is_admin else ''
-        manual_add_vm_button = '<button type="button" class="btn-add-vm" id="btnManualAddVm" onclick="openManualAddVmModal()" style="display:none; background: #42a5f5;">手动添加虚拟机</button>' if is_admin else ''
+        auto_add_vm_button = '<button type="button" class="btn-add-vm" id="btnAutoAddVm" onclick="addVmToHost()" style="display:none;">自动添加虚拟机</button>' if is_admin else ''
+        manual_add_vm_button = '<button type="button" class="btn-add-vm" id="btnManualAddVm" onclick="openManualAddVmModal()" style="display:none;">手动添加虚拟机</button>' if is_admin else ''
 
         gpu_sel = []
         for i in range(8):
@@ -2211,7 +2891,7 @@ class Handler(BaseHTTPRequestHandler):
         <div class="modal" id="manualAddModal">
             <div class="modal-content">
                 <div class="modal-header">
-                    <h2>手动添加物理机</h2>
+                    <h2>手动注册物理机</h2>
                     <button class="btn-close" onclick="closeManualAddModal()">&times;</button>
                 </div>
                 <form method="POST" action="/add" id="manualAddForm">
@@ -2506,15 +3186,21 @@ class Handler(BaseHTTPRequestHandler):
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>服务器资源管理系统 - 控制台</title>
+    <title>服务器智能管理系统 - 控制台</title>
     <style>{CSS}</style>
 </head>
 <body>
     <div class="header">
-        <h1>服务器资源管理系统 <span class="role-badge {role_class}">{role_display}</span></h1>
-        <div style="display:flex;align-items:center;gap:20px;">
-            <span>{username}</span>
-            <a href="/logout" style="color:white;text-decoration:none;background:rgba(255,255,255,0.2);padding:10px 20px;border-radius:8px;">退出登录</a>
+        <h1>服务器智能管理系统 <span class="role-badge {role_class}">{role_display}</span></h1>
+        <div class="user-menu">
+            <div class="user-menu-trigger" onclick="toggleUserMenu()">
+                <span>{username}</span>
+                <span>▼</span>
+            </div>
+            <div class="user-menu-dropdown" id="userMenuDropdown">
+                {f'<a href="/models" class="user-menu-item admin-only">模型管理</a>' if session.get('role') == 'admin' else ''}
+                <a href="/logout" class="user-menu-item">退出登录</a>
+            </div>
         </div>
     </div>
     <div class="container">
@@ -2583,18 +3269,20 @@ class Handler(BaseHTTPRequestHandler):
             </div>
         </div>
         
-        <div class="toolbar">
-            <div style="display:flex;align-items:center;">
-                {batch_buttons}
-            </div>
-            <div style="display:flex;align-items:center;">
-                {auto_add_vm_button}
-                {manual_add_vm_button}
-                {manual_add_button}
-                {add_button}
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+            <div class="tab-label inventory-tab">Inventory</div>
+            <div style="display:flex;align-items:center;gap:30px;">
+                <div style="display:flex;align-items:center;">
+                    {batch_buttons}
+                </div>
+                <div style="display:flex;align-items:center;">
+                    {auto_add_vm_button}
+                    {manual_add_vm_button}
+                    {manual_add_button}
+                    {add_button}
+                </div>
             </div>
         </div>
-        <div class="tab-label inventory-tab">Inventory</div>
         <div class="table-container">
             <table>
                 <thead>
@@ -2623,38 +3311,64 @@ class Handler(BaseHTTPRequestHandler):
     <script>
         let selectedIds = [];
         
-        function openModal() {{ document.getElementById('addModal').classList.add('active'); }}
-        function closeModal() {{ 
-            document.getElementById('addModal').classList.remove('active');
-            // 重置表单
-            document.getElementById('addForm').reset();
+        // Admin 特有的弹窗函数
+        function openModal() {{ 
+            const modal = document.getElementById('addModal');
+            if (modal) modal.classList.add('active'); 
         }}
-        document.getElementById('addModal').addEventListener('click', (e) => {{ if (e.target === e.currentTarget) closeModal(); }});
+        function closeModal() {{ 
+            const modal = document.getElementById('addModal');
+            if (modal) modal.classList.remove('active');
+            // 重置表单
+            const form = document.getElementById('addForm');
+            if (form) form.reset();
+        }}
         
         // 节点名输入弹窗
         function openNodeInputModal() {{ 
-            document.getElementById('nodeInputModal').classList.add('active'); 
-            document.getElementById('nodeNameInput').focus();
+            const modal = document.getElementById('nodeInputModal');
+            const input = document.getElementById('nodeNameInput');
+            if (modal) modal.classList.add('active'); 
+            if (input) input.focus();
         }}
         function closeNodeInputModal() {{ 
-            document.getElementById('nodeInputModal').classList.remove('active'); 
-            document.getElementById('nodeError').style.display = 'none';
-            document.getElementById('nodeNameInput').value = '';
+            const modal = document.getElementById('nodeInputModal');
+            const errorDiv = document.getElementById('nodeError');
+            const input = document.getElementById('nodeNameInput');
+            if (modal) modal.classList.remove('active'); 
+            if (errorDiv) errorDiv.style.display = 'none';
+            if (input) input.value = '';
         }}
-        document.getElementById('nodeInputModal').addEventListener('click', (e) => {{ 
-            if (e.target === e.currentTarget) closeNodeInputModal(); 
+        
+        // 动态绑定事件监听器（避免元素不存在时报错）
+        document.addEventListener('DOMContentLoaded', function() {{
+            const addModal = document.getElementById('addModal');
+            if (addModal) {{
+                addModal.addEventListener('click', (e) => {{ if (e.target === e.currentTarget) closeModal(); }});
+            }}
+            const nodeInputModal = document.getElementById('nodeInputModal');
+            if (nodeInputModal) {{
+                nodeInputModal.addEventListener('click', (e) => {{ 
+                    if (e.target === e.currentTarget) closeNodeInputModal(); 
+                }});
+            }}
         }});
         
         // 手动添加物理机弹窗
         function openManualAddModal() {{
-            document.getElementById('manualAddModal').classList.add('active');
-            document.getElementById('manualHostname').focus();
+            const modal = document.getElementById('manualAddModal');
+            const input = document.getElementById('manualHostname');
+            if (modal) modal.classList.add('active');
+            if (input) input.focus();
         }}
         
-        // 获取节点信息
+        // 获取节点信息（admin专用）
         async function fetchNodeInfo() {{
-            const nodeName = document.getElementById('nodeNameInput').value.trim();
+            const nodeNameInput = document.getElementById('nodeNameInput');
             const errorDiv = document.getElementById('nodeError');
+            if (!nodeNameInput || !errorDiv) return;
+            
+            const nodeName = nodeNameInput.value.trim();
             
             if (!nodeName) {{
                 errorDiv.textContent = '请输入节点名';
@@ -2668,25 +3382,34 @@ class Handler(BaseHTTPRequestHandler):
                 
                 if (data.success) {{
                     // 填充表单
-                    document.getElementById('physHostname').value = data.info.hostname || nodeName;
-                    document.getElementById('physCpu').value = data.info.cpu || '';
-                    document.getElementById('physMemValue').value = data.info.mem_value || '';
-                    document.getElementById('physMemUnit').value = data.info.mem_unit || 'GB';
+                    const physHostname = document.getElementById('physHostname');
+                    const physCpu = document.getElementById('physCpu');
+                    const physMemValue = document.getElementById('physMemValue');
+                    const physMemUnit = document.getElementById('physMemUnit');
+                    const physDiskValue = document.getElementById('physDiskValue');
+                    const physDiskUnit = document.getElementById('physDiskUnit');
+                    const physIp = document.getElementById('physIp');
+                    const physGpuCount = document.getElementById('physGpuCount');
+                    
+                    if (physHostname) physHostname.value = data.info.hostname || nodeName;
+                    if (physCpu) physCpu.value = data.info.cpu || '';
+                    if (physMemValue) physMemValue.value = data.info.mem_value || '';
+                    if (physMemUnit) physMemUnit.value = data.info.mem_unit || 'GB';
                     
                     // 填充磁盘信息并初始化原始GB值
                     const diskValue = data.info.disk_value || '';
-                    document.getElementById('physDiskValue').value = diskValue;
-                    document.getElementById('physDiskUnit').value = data.info.disk_unit || 'GB';
+                    if (physDiskValue) physDiskValue.value = diskValue;
+                    if (physDiskUnit) physDiskUnit.value = data.info.disk_unit || 'GB';
                     currentDiskValueGB = parseInt(diskValue) || 0;  // 保存原始GB值
                     
                     // 填充IP地址（如果API返回了）
-                    if (data.info.ip) {{
-                        document.getElementById('physIp').value = data.info.ip;
+                    if (data.info.ip && physIp) {{
+                        physIp.value = data.info.ip;
                     }}
                     
                     // 填充GPU数量（如果API返回了）
-                    if (data.info.gpu_count !== undefined) {{
-                        document.getElementById('physGpuCount').value = data.info.gpu_count;
+                    if (data.info.gpu_count !== undefined && physGpuCount) {{
+                        physGpuCount.value = data.info.gpu_count;
                     }}
                     
                     // 关闭节点输入弹窗，打开物理机添加弹窗
@@ -2702,11 +3425,16 @@ class Handler(BaseHTTPRequestHandler):
             }}
         }}
         
-        // 回车键提交
-        document.getElementById('nodeNameInput').addEventListener('keypress', function(e) {{
-            if (e.key === 'Enter') {{
-                e.preventDefault();
-                fetchNodeInfo();
+        // 回车键提交（动态绑定）
+        document.addEventListener('DOMContentLoaded', function() {{
+            const nodeNameInput = document.getElementById('nodeNameInput');
+            if (nodeNameInput) {{
+                nodeNameInput.addEventListener('keypress', function(e) {{
+                    if (e.key === 'Enter') {{
+                        e.preventDefault();
+                        fetchNodeInfo();
+                    }}
+                }});
             }}
         }});
         
@@ -2737,23 +3465,30 @@ class Handler(BaseHTTPRequestHandler):
             valueInput.value = Math.max(1, convertedValue);
         }}
         
-        // 监听数值变化，更新原始GB值
-        document.getElementById('physDiskValue').addEventListener('change', function() {{
-            const unitSelect = document.getElementById('physDiskUnit');
-            const currentValue = parseInt(this.value) || 0;
-            
-            // 根据当前单位反算GB值
-            if (unitSelect.value === 'GB') {{
-                currentDiskValueGB = currentValue;
-            }} else if (unitSelect.value === 'TB') {{
-                currentDiskValueGB = currentValue * 1024;
-            }} else if (unitSelect.value === 'PB') {{
-                currentDiskValueGB = currentValue * 1024 * 1024;
+        // 监听数值变化，更新原始GB值（动态绑定）
+        document.addEventListener('DOMContentLoaded', function() {{
+            const physDiskValue = document.getElementById('physDiskValue');
+            if (physDiskValue) {{
+                physDiskValue.addEventListener('change', function() {{
+                    const unitSelect = document.getElementById('physDiskUnit');
+                    if (!unitSelect) return;
+                    const currentValue = parseInt(this.value) || 0;
+                    
+                    // 根据当前单位反算GB值
+                    if (unitSelect.value === 'GB') {{
+                        currentDiskValueGB = currentValue;
+                    }} else if (unitSelect.value === 'TB') {{
+                        currentDiskValueGB = currentValue * 1024;
+                    }} else if (unitSelect.value === 'PB') {{
+                        currentDiskValueGB = currentValue * 1024 * 1024;
+                    }}
+                }});
             }}
         }});
         
         function toggleSelectAll() {{
             const selectAll = document.getElementById('selectAll');
+            if (!selectAll) return;
             const checkboxes = document.querySelectorAll('input[name="server_select"]');
             checkboxes.forEach(cb => {{
                 cb.checked = selectAll.checked;
@@ -2785,9 +3520,9 @@ class Handler(BaseHTTPRequestHandler):
             const btnManualAddVm = document.getElementById('btnManualAddVm');
             
             if (selectedIds.length > 0) {{
-                batchActions.classList.add('active');
+                if (batchActions) batchActions.classList.add('active');
             }} else {{
-                batchActions.classList.remove('active');
+                if (batchActions) batchActions.classList.remove('active');
             }}
             
             // 检查选中的类型和注册方式，显示对应的添加虚拟机按钮
@@ -3098,52 +3833,70 @@ class Handler(BaseHTTPRequestHandler):
         // 更新虚拟机GPU数量显示
         function updateVmGpuCount() {{
             const checkedGpus = document.querySelectorAll('#addVmModal .gpu-selection input[type="checkbox"]:checked');
-            document.getElementById('vmGpuCount').value = checkedGpus.length;
+            const vmGpuCount = document.getElementById('vmGpuCount');
+            if (vmGpuCount) vmGpuCount.value = checkedGpus.length;
         }}
         
         // 更新手动添加虚拟机GPU数量显示
         function updateManualVmGpuCount() {{
             const checkedGpus = document.querySelectorAll('#manualAddVmModal .gpu-selection input[type="checkbox"]:checked');
-            document.getElementById('manualVmGpuCount').value = checkedGpus.length;
+            const manualVmGpuCount = document.getElementById('manualVmGpuCount');
+            if (manualVmGpuCount) manualVmGpuCount.value = checkedGpus.length;
         }}
         
         // 填充虚拟机表单
         async function fillVmForm(info, parentHost, vmid) {{
-            document.getElementById('vmParentHost').value = parentHost;
-            document.getElementById('vmProxmoxVmid').value = vmid;
-            document.getElementById('vmHostname').value = info.hostname || '';
-            document.getElementById('vmIp').value = info.ip || '';
-            document.getElementById('vmCpu').value = info.cpu || '';
-            document.getElementById('vmMemValue').value = info.mem_value || '';
-            document.getElementById('vmMemUnit').value = info.mem_unit || 'GB';
-            document.getElementById('vmDiskValue').value = info.disk_value || '';
-            document.getElementById('vmDiskUnit').value = info.disk_unit || 'GB';
+            const vmParentHost = document.getElementById('vmParentHost');
+            const vmProxmoxVmid = document.getElementById('vmProxmoxVmid');
+            const vmHostname = document.getElementById('vmHostname');
+            const vmIp = document.getElementById('vmIp');
+            const vmCpu = document.getElementById('vmCpu');
+            const vmMemValue = document.getElementById('vmMemValue');
+            const vmMemUnit = document.getElementById('vmMemUnit');
+            const vmDiskValue = document.getElementById('vmDiskValue');
+            const vmDiskUnit = document.getElementById('vmDiskUnit');
+            
+            if (vmParentHost) vmParentHost.value = parentHost;
+            if (vmProxmoxVmid) vmProxmoxVmid.value = vmid;
+            if (vmHostname) vmHostname.value = info.hostname || '';
+            if (vmIp) vmIp.value = info.ip || '';
+            if (vmCpu) vmCpu.value = info.cpu || '';
+            if (vmMemValue) vmMemValue.value = info.mem_value || '';
+            if (vmMemUnit) vmMemUnit.value = info.mem_unit || 'GB';
+            if (vmDiskValue) vmDiskValue.value = info.disk_value || '';
+            if (vmDiskUnit) vmDiskUnit.value = info.disk_unit || 'GB';
             
             // 获取物理机GPU信息并生成选择框
             try {{
                 const response = await fetch('/api/host_gpu_info?hostname=' + encodeURIComponent(parentHost));
                 const data = await response.json();
+                const vmGpuSelection = document.getElementById('vmGpuSelection');
+                const vmGpuCount = document.getElementById('vmGpuCount');
                 if (data.success) {{
                     const gpuSelectionHtml = generateGpuSelection(data.gpu_count, data.used_gpus, 'gpu', 'updateVmGpuCount');
-                    document.getElementById('vmGpuSelection').innerHTML = gpuSelectionHtml;
-                    document.getElementById('vmGpuCount').value = 0;
+                    if (vmGpuSelection) vmGpuSelection.innerHTML = gpuSelectionHtml;
+                    if (vmGpuCount) vmGpuCount.value = 0;
                 }} else {{
-                    document.getElementById('vmGpuSelection').innerHTML = '<p style="color:#888;">无法获取GPU信息</p>';
+                    if (vmGpuSelection) vmGpuSelection.innerHTML = '<p style="color:#888;">无法获取GPU信息</p>';
                 }}
             }} catch (err) {{
-                document.getElementById('vmGpuSelection').innerHTML = '<p style="color:#888;">获取GPU信息失败</p>';
+                const vmGpuSelection = document.getElementById('vmGpuSelection');
+                if (vmGpuSelection) vmGpuSelection.innerHTML = '<p style="color:#888;">获取GPU信息失败</p>';
             }}
         }}
         
         // 打开添加虚拟机弹窗
         function openAddVmModal() {{
-            document.getElementById('addVmModal').classList.add('active');
+            const addVmModal = document.getElementById('addVmModal');
+            if (addVmModal) addVmModal.classList.add('active');
         }}
         
         // 关闭添加虚拟机弹窗
         function closeAddVmModal() {{
-            document.getElementById('addVmModal').classList.remove('active');
-            document.getElementById('addVmForm').reset();
+            const addVmModal = document.getElementById('addVmModal');
+            const addVmForm = document.getElementById('addVmForm');
+            if (addVmModal) addVmModal.classList.remove('active');
+            if (addVmForm) addVmForm.reset();
         }}
         
 
@@ -3170,35 +3923,46 @@ class Handler(BaseHTTPRequestHandler):
             }}
             
             // 设置父主机名
-            document.getElementById('manualVmParentHost').value = hostname;
+            const manualVmParentHost = document.getElementById('manualVmParentHost');
+            if (manualVmParentHost) manualVmParentHost.value = hostname;
             
             // 获取物理机GPU信息并生成选择框
             try {{
                 const response = await fetch('/api/host_gpu_info?hostname=' + encodeURIComponent(hostname));
                 const data = await response.json();
+                const manualVmGpuSelection = document.getElementById('manualVmGpuSelection');
+                const manualVmGpuCount = document.getElementById('manualVmGpuCount');
                 if (data.success) {{
                     const gpuSelectionHtml = generateGpuSelection(data.gpu_count, data.used_gpus, 'gpu', 'updateManualVmGpuCount');
-                    document.getElementById('manualVmGpuSelection').innerHTML = gpuSelectionHtml;
-                    document.getElementById('manualVmGpuCount').value = 0;
+                    if (manualVmGpuSelection) manualVmGpuSelection.innerHTML = gpuSelectionHtml;
+                    if (manualVmGpuCount) manualVmGpuCount.value = 0;
                 }} else {{
-                    document.getElementById('manualVmGpuSelection').innerHTML = '<p style="color:#888;">无法获取GPU信息</p>';
+                    if (manualVmGpuSelection) manualVmGpuSelection.innerHTML = '<p style="color:#888;">无法获取GPU信息</p>';
                 }}
             }} catch (err) {{
-                document.getElementById('manualVmGpuSelection').innerHTML = '<p style="color:#888;">获取GPU信息失败</p>';
+                const manualVmGpuSelection = document.getElementById('manualVmGpuSelection');
+                if (manualVmGpuSelection) manualVmGpuSelection.innerHTML = '<p style="color:#888;">获取GPU信息失败</p>';
             }}
             
             // 打开弹窗
-            document.getElementById('manualAddVmModal').classList.add('active');
-            document.getElementById('manualVmHostname').focus();
+            const manualAddVmModal = document.getElementById('manualAddVmModal');
+            const manualVmHostname = document.getElementById('manualVmHostname');
+            if (manualAddVmModal) manualAddVmModal.classList.add('active');
+            if (manualVmHostname) manualVmHostname.focus();
         }}
         
         function closeManualAddVmModal() {{
-            document.getElementById('manualAddVmModal').classList.remove('active');
-            document.getElementById('manualAddVmForm').reset();
+            const manualAddVmModal = document.getElementById('manualAddVmModal');
+            const manualAddVmForm = document.getElementById('manualAddVmForm');
+            const manualVmVerifyStatusArea = document.getElementById('manualVmVerifyStatusArea');
+            const manualVmSaveBtn = document.getElementById('manualVmSaveBtn');
+            
+            if (manualAddVmModal) manualAddVmModal.classList.remove('active');
+            if (manualAddVmForm) manualAddVmForm.reset();
             // 清除验证状态和按钮文字
             manualVmVerified = false;
-            document.getElementById('manualVmVerifyStatusArea').innerHTML = '';
-            document.getElementById('manualVmSaveBtn').textContent = '保存';
+            if (manualVmVerifyStatusArea) manualVmVerifyStatusArea.innerHTML = '';
+            if (manualVmSaveBtn) manualVmSaveBtn.textContent = '保存';
         }}
         
         // SSH验证状态
@@ -3220,12 +3984,18 @@ class Handler(BaseHTTPRequestHandler):
         
         // 验证手动注册物理机的SSH连接
         async function verifyManualHost() {{
-            const ip = document.getElementById('manualIp').value.trim();
-            const username = document.getElementById('manualSshUser').value.trim();
-            const password = document.getElementById('manualSshPassword').value;
+            const ipEl = document.getElementById('manualIp');
+            const usernameEl = document.getElementById('manualSshUser');
+            const passwordEl = document.getElementById('manualSshPassword');
             const verifyBtn = document.getElementById('manualVerifyBtn');
             const saveBtn = document.getElementById('manualSaveBtn');
             const statusArea = document.getElementById('manualVerifyStatusArea');
+            
+            if (!ipEl || !usernameEl || !passwordEl || !verifyBtn || !saveBtn || !statusArea) return;
+            
+            const ip = ipEl.value.trim();
+            const username = usernameEl.value.trim();
+            const password = passwordEl.value;
             
             if (!ip || !username || !password) {{
                 alert('请先填写IP地址、SSH用户名和密码');
@@ -3249,7 +4019,8 @@ class Handler(BaseHTTPRequestHandler):
                 manualVerified = data.success;
                 
                 // 更新隐藏字段记录验证状态
-                document.getElementById('manualSshVerified').value = data.success ? 'true' : 'false';
+                const manualSshVerified = document.getElementById('manualSshVerified');
+                if (manualSshVerified) manualSshVerified.value = data.success ? 'true' : 'false';
                 
                 // 根据验证结果修改保存按钮文字
                 if (data.success) {{
@@ -3260,7 +4031,8 @@ class Handler(BaseHTTPRequestHandler):
             }} catch (err) {{
                 statusArea.innerHTML = '<span class="verify-status error">✗ 验证请求失败: ' + err.message + '</span>';
                 saveBtn.textContent = '仍然保存';
-                document.getElementById('manualSshVerified').value = 'false';
+                const manualSshVerified = document.getElementById('manualSshVerified');
+                if (manualSshVerified) manualSshVerified.value = 'false';
             }} finally {{
                 verifyBtn.disabled = false;
                 verifyBtn.textContent = '验证连接';
@@ -3275,12 +4047,18 @@ class Handler(BaseHTTPRequestHandler):
         
         // 验证手动添加虚拟机的SSH连接
         async function verifyManualVmHost() {{
-            const ip = document.getElementById('manualVmIp').value.trim();
-            const username = document.getElementById('manualVmSshUser').value.trim();
-            const password = document.getElementById('manualVmSshPassword').value;
+            const ipEl = document.getElementById('manualVmIp');
+            const usernameEl = document.getElementById('manualVmSshUser');
+            const passwordEl = document.getElementById('manualVmSshPassword');
             const verifyBtn = document.getElementById('manualVmVerifyBtn');
             const saveBtn = document.getElementById('manualVmSaveBtn');
             const statusArea = document.getElementById('manualVmVerifyStatusArea');
+            
+            if (!ipEl || !usernameEl || !passwordEl || !verifyBtn || !saveBtn || !statusArea) return;
+            
+            const ip = ipEl.value.trim();
+            const username = usernameEl.value.trim();
+            const password = passwordEl.value;
             
             if (!ip || !username || !password) {{
                 alert('请先填写IP地址、SSH用户名和密码');
@@ -3304,7 +4082,8 @@ class Handler(BaseHTTPRequestHandler):
                 manualVmVerified = data.success;
                 
                 // 更新隐藏字段记录验证状态
-                document.getElementById('manualVmSshVerified').value = data.success ? 'true' : 'false';
+                const manualVmSshVerified = document.getElementById('manualVmSshVerified');
+                if (manualVmSshVerified) manualVmSshVerified.value = data.success ? 'true' : 'false';
                 
                 // 根据验证结果修改保存按钮文字
                 if (data.success) {{
@@ -3315,7 +4094,8 @@ class Handler(BaseHTTPRequestHandler):
             }} catch (err) {{
                 statusArea.innerHTML = '<span class="verify-status error">✗ 验证请求失败: ' + err.message + '</span>';
                 saveBtn.textContent = '仍然保存';
-                document.getElementById('manualVmSshVerified').value = 'false';
+                const manualVmSshVerified = document.getElementById('manualVmSshVerified');
+                if (manualVmSshVerified) manualVmSshVerified.value = 'false';
             }} finally {{
                 verifyBtn.disabled = false;
                 verifyBtn.textContent = '验证连接';
@@ -3330,16 +4110,22 @@ class Handler(BaseHTTPRequestHandler):
         
         // 关闭弹窗时重置验证状态
         function closeManualAddModal() {{
-            document.getElementById('manualAddModal').classList.remove('active');
-            document.getElementById('manualAddForm').reset();
+            const manualAddModal = document.getElementById('manualAddModal');
+            const manualAddForm = document.getElementById('manualAddForm');
+            const manualVerifyStatusArea = document.getElementById('manualVerifyStatusArea');
+            const manualSaveBtn = document.getElementById('manualSaveBtn');
+            
+            if (manualAddModal) manualAddModal.classList.remove('active');
+            if (manualAddForm) manualAddForm.reset();
             manualVerified = false;
-            document.getElementById('manualVerifyStatusArea').innerHTML = '';
-            document.getElementById('manualSaveBtn').textContent = '保存';
+            if (manualVerifyStatusArea) manualVerifyStatusArea.innerHTML = '';
+            if (manualSaveBtn) manualSaveBtn.textContent = '保存';
         }}
         
         function updateGpuCount() {{
             const checkedGpus = document.querySelectorAll('.gpu-selection input[type="checkbox"]:checked');
-            document.getElementById('gpuCount').value = checkedGpus.length;
+            const gpuCount = document.getElementById('gpuCount');
+            if (gpuCount) gpuCount.value = checkedGpus.length;
         }}
         
         // 显示性能监控面板
@@ -3347,6 +4133,21 @@ class Handler(BaseHTTPRequestHandler):
         let currentPerfServerId = null;
         // 日志缓存：{{serverId: {{logs: string, timestamp: number}}}}
         let logsCache = {{}};
+        
+        // 用户菜单切换
+        function toggleUserMenu() {{
+            const dropdown = document.getElementById('userMenuDropdown');
+            dropdown.classList.toggle('active');
+        }}
+        
+        // 点击外部关闭用户菜单
+        document.addEventListener('click', function(e) {{
+            const menu = document.querySelector('.user-menu');
+            if (menu && !menu.contains(e.target)) {{
+                const dropdown = document.getElementById('userMenuDropdown');
+                if (dropdown) dropdown.classList.remove('active');
+            }}
+        }});
         
         // Markdown 渲染函数（简化版）
         function renderMarkdown(text) {{
@@ -3411,6 +4212,14 @@ class Handler(BaseHTTPRequestHandler):
         
         async function showPerformance(serverId, event) {{
             if (event) event.stopPropagation();
+            
+            // 如果切换到不同的服务器，隐藏AI诊断对话框
+            if (currentPerfServerId && currentPerfServerId !== serverId) {{
+                const aiDialog = document.getElementById('aiDiagnosisDialog');
+                aiDialog.classList.remove('active');
+                // 清空AI诊断内容
+                document.getElementById('aiDiagnosisContent').innerHTML = '';
+            }}
             
             currentPerfServerId = serverId;
             const panel = document.getElementById('performancePanel');
@@ -3581,6 +4390,310 @@ class Handler(BaseHTTPRequestHandler):
 </html>"""
         self.send_html(html)
 
+    def render_models_page(self, session):
+        """渲染模型管理页面"""
+        config = load_config()
+        models = config.get('models', [])
+        current_model = config.get('current_model', '')
+        username = session.get('username', 'Unknown')
+        
+        # 预定义公共模型选项
+        public_model_options = '''
+            <option value="">请选择模型</option>
+            <option value="deepseek-chat">DeepSeek Chat</option>
+            <option value="kimi-latest">Kimi Latest</option>
+            <option value="minimax-text-01">MiniMax</option>
+        '''
+        
+        # 生成模型列表HTML
+        models_html = ''
+        for model in models:
+            model_id = model.get('id', '')
+            model_name = model.get('name', '')
+            model_type = model.get('type', 'public')
+            model_type_label = '公共' if model_type == 'public' else '本地'
+            model_type_class = 'model-type-public' if model_type == 'public' else 'model-type-local'
+            is_selected = 'selected' if model_id == current_model else ''
+            is_checked = 'checked' if model_id == current_model else ''
+            
+            models_html += f'''
+            <div class="model-card {is_selected}" data-model-id="{model_id}">
+                <input type="radio" name="selected_model" value="{model_id}" class="model-radio" {is_checked} onchange="selectModel('{model_id}')">
+                <div class="model-info">
+                    <div class="model-name">{model_name}<span class="model-type {model_type_class}">{model_type_label}</span></div>
+                    <div class="model-details">Model: {model.get('model', '')} | URL: {model.get('base_url', '')}</div>
+                </div>
+                <div class="model-actions">
+                    <button class="btn-model-test" onclick="testModel(event, '{model_id}')">验证</button>
+                    <button class="btn-model-delete" onclick="deleteModel(event, '{model_id}')">删除</button>
+                </div>
+            </div>
+            '''
+        
+        if not models_html:
+            models_html = '<div style="text-align:center;color:#888;padding:40px;">暂无模型，请添加</div>'
+        
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>模型管理 - 服务器智能管理系统</title>
+    <style>{CSS}</style>
+</head>
+<body>
+    <div class="header">
+        <h1>服务器智能管理系统 <span class="role-badge admin">管理员</span></h1>
+        <div class="user-menu">
+            <div class="user-menu-trigger" onclick="toggleUserMenu()">
+                <span>{username}</span>
+                <span>▲</span>
+            </div>
+            <div class="user-menu-dropdown" id="userMenuDropdown">
+                <a href="/models" class="user-menu-item admin-only">模型管理</a>
+                <a href="/logout" class="user-menu-item">退出登录</a>
+            </div>
+        </div>
+    </div>
+    <div class="models-container">
+        <a href="/dashboard" class="back-link">← 返回控制台</a>
+        <div class="models-header">
+            <h2>模型管理</h2>
+        </div>
+        
+        <h3 style="margin-bottom:15px;color:#555;">已注册模型（点击单选使用）</h3>
+        <div id="modelsList">
+            {models_html}
+        </div>
+        
+        <div class="add-model-section">
+            <h3>添加新模型</h3>
+            <div class="model-tabs">
+                <button type="button" class="model-tab active" onclick="switchTab('public')" id="tabPublic">公共模型</button>
+                <button type="button" class="model-tab" onclick="switchTab('local')" id="tabLocal">本地模型</button>
+            </div>
+            
+            <form id="addModelForm">
+                <div class="model-form-row">
+                    <div class="model-form-group">
+                        <label>模型显示名称 *</label>
+                        <input type="text" id="modelName" placeholder="例如：我的DeepSeek" required>
+                    </div>
+                    <div class="model-form-group" id="publicModelGroup">
+                        <label>模型 *</label>
+                        <select id="publicModel">
+                            {public_model_options}
+                        </select>
+                    </div>
+                    <div class="model-form-group" id="localModelGroup" style="display:none;">
+                        <label>Model *</label>
+                        <input type="text" id="localModel" placeholder="例如：llama2-7b">
+                    </div>
+                </div>
+                
+                <div class="model-form-row" id="localUrlRow" style="display:none;">
+                    <div class="model-form-group" style="flex:2;">
+                        <label>Base URL *</label>
+                        <input type="text" id="baseUrl" placeholder="例如：http://localhost:11434/v1">
+                    </div>
+                </div>
+                
+                <div class="model-form-row">
+                    <div class="model-form-group">
+                        <label>API Key {f'<span id="apiKeyRequired">*</span>' if True else ''}</label>
+                        <input type="password" id="apiKey" placeholder="输入API Key">
+                    </div>
+                </div>
+                
+                <button type="submit" class="btn-add-model">添加模型</button>
+                <span id="addModelMsg" style="margin-left:15px;"></span>
+            </form>
+        </div>
+    </div>
+    
+    <script>
+        // 用户菜单切换
+        function toggleUserMenu() {{
+            const dropdown = document.getElementById('userMenuDropdown');
+            dropdown.classList.toggle('active');
+        }}
+        
+        document.addEventListener('click', function(e) {{
+            const menu = document.querySelector('.user-menu');
+            if (menu && !menu.contains(e.target)) {{
+                const dropdown = document.getElementById('userMenuDropdown');
+                if (dropdown) dropdown.classList.remove('active');
+            }}
+        }});
+        
+        // 切换标签页
+        let currentTab = 'public';
+        function switchTab(tab) {{
+            currentTab = tab;
+            document.getElementById('tabPublic').classList.toggle('active', tab === 'public');
+            document.getElementById('tabLocal').classList.toggle('active', tab === 'local');
+            document.getElementById('publicModelGroup').style.display = tab === 'public' ? 'block' : 'none';
+            document.getElementById('localModelGroup').style.display = tab === 'local' ? 'block' : 'none';
+            document.getElementById('localUrlRow').style.display = tab === 'local' ? 'flex' : 'none';
+            document.getElementById('apiKeyRequired').style.display = tab === 'public' ? 'inline' : 'none';
+        }}
+        
+        // 选择模型
+        async function selectModel(modelId) {{
+            try {{
+                const response = await fetch('/api/models/select', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{model_id: modelId}})
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    document.querySelectorAll('.model-card').forEach(card => card.classList.remove('selected'));
+                    document.querySelector(`[data-model-id="${{modelId}}"]`).classList.add('selected');
+                }} else {{
+                    alert('选择模型失败：' + (data.error || '未知错误'));
+                }}
+            }} catch (e) {{
+                alert('请求失败：' + e.message);
+            }}
+        }}
+        
+        // 测试模型
+        async function testModel(event, modelId) {{
+            const btn = event.target;
+            const originalText = btn.textContent;
+            btn.textContent = '验证中...';
+            btn.disabled = true;
+            
+            // 创建超时控制
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15秒超时
+            
+            try {{
+                const response = await fetch('/api/models/test', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{model_id: modelId}}),
+                    signal: controller.signal
+                }});
+                clearTimeout(timeoutId);
+                
+                if (!response.ok) {{
+                    alert('验证失败：服务器返回错误 ' + response.status);
+                    return;
+                }}
+                
+                const data = await response.json();
+                if (data.success) {{
+                    alert('验证成功！模型可正常访问。');
+                }} else {{
+                    alert('验证失败：' + (data.error || '未知错误'));
+                }}
+            }} catch (e) {{
+                if (e.name === 'AbortError') {{
+                    alert('验证超时：请求超过15秒未响应，请检查网络或模型配置');
+                }} else {{
+                    alert('请求失败：' + e.message);
+                }}
+            }} finally {{
+                clearTimeout(timeoutId);
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }}
+        }}
+        
+        // 删除模型
+        async function deleteModel(event, modelId) {{
+            if (!confirm('确定要删除此模型吗？')) return;
+            
+            try {{
+                const response = await fetch('/api/models/delete', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{model_id: modelId}})
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    location.reload();
+                }} else {{
+                    alert('删除失败：' + (data.error || '未知错误'));
+                }}
+            }} catch (e) {{
+                alert('请求失败：' + e.message);
+            }}
+        }}
+        
+        // 添加模型表单提交
+        document.getElementById('addModelForm').addEventListener('submit', async function(e) {{
+            e.preventDefault();
+            const msgEl = document.getElementById('addModelMsg');
+            msgEl.textContent = '';
+            
+            const name = document.getElementById('modelName').value.trim();
+            const apiKey = document.getElementById('apiKey').value.trim();
+            
+            let model, baseUrl;
+            if (currentTab === 'public') {{
+                model = document.getElementById('publicModel').value;
+                // 根据选择的模型设置URL
+                const urlMap = {{
+                    'deepseek-chat': 'https://api.deepseek.com',
+                    'kimi-latest': 'https://api.moonshot.cn',
+                    'minimax-text-01': 'https://api.minimax.chat'
+                }};
+                baseUrl = urlMap[model];
+                if (!model) {{
+                    msgEl.textContent = '请选择一个公共模型';
+                    msgEl.style.color = '#f44336';
+                    return;
+                }}
+            }} else {{
+                model = document.getElementById('localModel').value.trim();
+                baseUrl = document.getElementById('baseUrl').value.trim();
+            }}
+            
+            if (!name || !model || (currentTab === 'local' && !baseUrl)) {{
+                msgEl.textContent = '请填写所有必填项';
+                msgEl.style.color = '#f44336';
+                return;
+            }}
+            
+            if (currentTab === 'public' && !apiKey) {{
+                msgEl.textContent = '公共模型需要API Key';
+                msgEl.style.color = '#f44336';
+                return;
+            }}
+            
+            try {{
+                const response = await fetch('/api/models/add', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{
+                        name: name,
+                        model: model,
+                        api_key: apiKey,
+                        base_url: baseUrl,
+                        type: currentTab
+                    }})
+                }});
+                const data = await response.json();
+                if (data.success) {{
+                    msgEl.textContent = '添加成功！';
+                    msgEl.style.color = '#4caf50';
+                    setTimeout(() => location.reload(), 1000);
+                }} else {{
+                    msgEl.textContent = '添加失败：' + (data.error || '未知错误');
+                    msgEl.style.color = '#f44336';
+                }}
+            }} catch (e) {{
+                msgEl.textContent = '请求失败：' + e.message;
+                msgEl.style.color = '#f44336';
+            }}
+        }});
+    </script>
+</body>
+</html>"""
+        self.send_html(html)
+
     def render_edit_form(self, server_id):
         data = load_data()
         server = None
@@ -3652,7 +4765,7 @@ class Handler(BaseHTTPRequestHandler):
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>修改服务器 - 服务器资源管理系统</title>
+    <title>修改服务器 - 服务器智能管理系统</title>
     <style>{CSS}</style>
 </head>
 <body>
@@ -3718,7 +4831,8 @@ class Handler(BaseHTTPRequestHandler):
                     </div>
                     <div class="form-group">
                         <label>GPU数量 *</label>
-                        <input type="number" name="gpu_count" id="gpuCount" min="0" max="8" value="{server['gpu_count']}" required>
+                        <input type="number" name="gpu_count" id="gpuCount" min="0" max="8" value="{server['gpu_count']}" required {'readonly' if server["type"] == "virtual" else ''} style="{'background:#f0f0f0;cursor:not-allowed;' if server['type'] == 'virtual' else ''}">
+                        {'<small style="color:#666;">由分配的GPU自动计算</small>' if server["type"] == "virtual" else ''}
                     </div>
                 </div>
                 <div class="form-group">
@@ -3737,6 +4851,12 @@ class Handler(BaseHTTPRequestHandler):
             </form>
         </div>
     </div>
+    <script>
+        function updateGpuCount() {{
+            const checkedGpus = document.querySelectorAll('.gpu-selection input[type="checkbox"]:checked');
+            document.getElementById('gpuCount').value = checkedGpus.length;
+        }}
+    </script>
 </body>
 </html>"""
         self.send_html(html)
@@ -3748,10 +4868,9 @@ if __name__ == '__main__':
         save_users({'admin': {'password': '123456', 'role': 'admin'}})
     
     print('=' * 50)
-    print('服务器资源管理系统 v2.0')
+    print('服务器智能管理系统 v2.0')
     print('=' * 50)
     print('访问地址: http://127.0.0.1:5000')
-    print('默认账号: admin / 123456')
     print('=' * 50)
     print('按 Ctrl+C 停止服务器')
     print('=' * 50)

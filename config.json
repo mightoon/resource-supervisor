@@ -15,13 +15,13 @@
       "type": "public"
     },
     {
-      "id": "ebbf8835",
-      "name": "qwen35",
-      "model": "qwen35-35b",
+      "id": "ef2213ce",
+      "name": "qwen36",
+      "model": "qwen36-35b",
       "api_key": "",
-      "base_url": "http://192.168.100.242:10122/v1",
+      "base_url": "http://192.168.100.242:10136/v1",
       "type": "local"
     }
   ],
-  "current_model": "ebbf8835"
+  "current_model": "679b663d"
 }

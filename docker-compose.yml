@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  app:
+    image: resource-management:latest
+    container_name: resource-management
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - PORT=5001
+      - HOST=0.0.0.0
+      - BASE_PATH=/resource-management
+    volumes:
+      - ./config.json:/app/config.json
+      - ./servers.json:/app/servers.json
+      - ./users.json:/app/users.json

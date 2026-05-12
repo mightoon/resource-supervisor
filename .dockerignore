@@ -1,0 +1,14 @@
+__pycache__/
+dist/
+build/
+*.pyc
+*.spec
+*.bat
+*.pdf
+*.md
+app.py
+server.py
+build.py
+test_gpu_detection.py
+templates/
+.codebuddy/

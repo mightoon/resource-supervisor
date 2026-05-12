@@ -44,10 +44,10 @@
    在内网服务器上双击运行 `一键启动.bat`
 
 3. **访问系统**
-   - 启动后会自动打开浏览器访问 `http://localhost:8080`
+   - 启动后会自动打开浏览器访问 `http://localhost:5001`
    - 内网其他机器可通过以下地址访问：
-     - `http://<服务器IP>:8080`
-     - `http://<服务器主机名>:8080`
+     - `http://<服务器IP>:5001`
+     - `http://<服务器主机名>:5001`
 
 4. **修改端口（可选）**
    如需修改端口，创建 `设置端口.bat`：
@@ -76,7 +76,7 @@ RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua
 
 COPY . .
 
-EXPOSE 8080
+EXPOSE 5001
 
 CMD ["python", "server_v2.py"]
 ```
@@ -84,13 +84,13 @@ CMD ["python", "server_v2.py"]
 构建并运行：
 ```bash
 docker build -t server-manager .
-docker run -d -p 8080:8080 -v $(pwd)/data:/app/data server-manager
+docker run -d -p 5001:5001 -v $(pwd)/data:/app/data server-manager
 ```
 
 ## ⚙️ 配置说明
 
 ### 修改端口号
-如需修改默认端口（8080），可创建 `.env` 文件或在启动前设置环境变量：
+如需修改默认端口（5001），可创建 `.env` 文件或在启动前设置环境变量：
 
 ```bash
 set PORT=8081
@@ -119,12 +119,12 @@ set PORT=8081
 ## 🛠️ 常见问题
 
 ### Q1: 打包后程序无法启动？
-- 检查 8080 端口是否被占用
+- 检查 5001 端口是否被占用
 - 检查是否有杀毒软件拦截
 - 尝试以管理员身份运行
 
 ### Q2: 内网其他机器无法访问？
-- 检查服务器防火墙设置，开放 8080 端口
+- 检查服务器防火墙设置，开放 5001 端口
 - 检查是否绑定到 localhost，应绑定到 0.0.0.0
 
 ### Q3: 数据会丢失吗？

@@ -9,7 +9,7 @@ from proxmoxer import ProxmoxAPI
 # Proxmox API 配置
 PROXMOX_HOST = "192.168.100.160"
 PROXMOX_USER = "root@pam"
-PROXMOX_PASSWORD = "xxx"
+PROXMOX_PASSWORD = "cdta@123"
 
 def test_gpu_detection():
     """测试GPU检测"""

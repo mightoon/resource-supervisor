@@ -7,6 +7,10 @@ import re
 import base64
 import http.client
 
+# 路径前缀，用于反向代理子路径部署（如 /resource-management/）
+# 留空表示根路径部署，设置如 '/resource-management' 表示子路径部署
+BASE_PATH = os.environ.get('BASE_PATH', '').rstrip('/')
+
 # 加载配置文件
 def load_config():
     config_file = 'config.json'
@@ -14,7 +18,7 @@ def load_config():
         "proxmox": {
             "host": "192.168.100.160",
             "user": "root@pam",
-            "password": "xxx",
+            "password": "cdta@123",
             "verify_ssl": False
         }
     }
@@ -31,7 +35,7 @@ CONFIG = load_config()
 PROXMOX_CONFIG = CONFIG.get('proxmox', {})
 PROXMOX_HOST = PROXMOX_CONFIG.get('host', '192.168.100.160')
 PROXMOX_USER = PROXMOX_CONFIG.get('user', 'root@pam')
-PROXMOX_PASSWORD = PROXMOX_CONFIG.get('password', 'xxx')
+PROXMOX_PASSWORD = PROXMOX_CONFIG.get('password', 'cdta@123')
 PROXMOX_VERIFY_SSL = PROXMOX_CONFIG.get('verify_ssl', False)
 
 # DeepSeek API 配置
@@ -143,16 +147,22 @@ def test_model_connection(base_url, model, api_key, model_type='public'):
     # 对于 Qwen 模型，根据版本使用不同方式关闭 thinking 模式
     model_lower = model.lower()
     if 'qwen' in model_lower:
-        # Qwen3.5 使用 chat_template_kwargs
-        if 'qwen3.5' in model_lower or 'qwen35' in model_lower:
-            payload["chat_template_kwargs"] = {
-                "enable_thinking": False,
-                "thinking": False
-            }
-        # Qwen3 和 Qwen2.5 尝试使用顶层参数
-        elif 'qwen3' in model_lower or 'qwen2.5' in model_lower or 'qwen25' in model_lower:
+        if model_lower.startswith('qwen3'):
+            # qwen3 后紧跟的字符决定分类：
+            # qwen3-xxx → 标准版 qwen3，仅添加 enable_thinking: False
+            # qwen3x / qwen3.x → qwen3.x 变体，使用 chat_template_kwargs
+            after_qwen3 = model_lower[5:]  # 'qwen3' 之后的部分
+            if after_qwen3 and after_qwen3[0] != '-':
+                # qwen3.x (qwen35, qwen36, qwen3.5, qwen3.6 等)
+                payload["chat_template_kwargs"] = {
+                    "enable_thinking": False,
+                    "thinking": False
+                }
+            else:
+                # qwen3-xxx (标准版)
+                payload["enable_thinking"] = False
+        elif 'qwen2.5' in model_lower or 'qwen25' in model_lower:
             payload["enable_thinking"] = False
-            payload["thinking"] = False
     
     headers = {
         "Content-Type": "application/json"
@@ -248,17 +258,22 @@ def deepseek_chat_stream(messages):
         # 对于 Qwen 模型，根据版本使用不同方式关闭 thinking 模式
         model_name_lower = model_name.lower()
         if 'qwen' in model_name_lower:
-            # Qwen3.5 使用 chat_template_kwargs
-            if 'qwen3.5' in model_name_lower or 'qwen35' in model_name_lower:
-                payload["chat_template_kwargs"] = {
-                    "enable_thinking": False,
-                    "thinking": False
-                }
-            # Qwen3 和 Qwen2.5 尝试使用顶层参数（某些部署方式支持）
-            elif 'qwen3' in model_name_lower or 'qwen2.5' in model_name_lower or 'qwen25' in model_name_lower:
-                # 尝试使用额外参数关闭 thinking（部分 vLLM/SGLang 部署支持）
+            if model_name_lower.startswith('qwen3'):
+                # qwen3 后紧跟的字符决定分类：
+                # qwen3-xxx → 标准版 qwen3，仅添加 enable_thinking: False
+                # qwen3x / qwen3.x → qwen3.x 变体，使用 chat_template_kwargs
+                after_qwen3 = model_name_lower[5:]  # 'qwen3' 之后的部分
+                if after_qwen3 and after_qwen3[0] != '-':
+                    # qwen3.x (qwen35, qwen36, qwen3.5, qwen3.6 等)
+                    payload["chat_template_kwargs"] = {
+                        "enable_thinking": False,
+                        "thinking": False
+                    }
+                else:
+                    # qwen3-xxx (标准版)
+                    payload["enable_thinking"] = False
+            elif 'qwen2.5' in model_name_lower or 'qwen25' in model_name_lower:
                 payload["enable_thinking"] = False
-                payload["thinking"] = False
         
         headers = {
             "Content-Type": "application/json",
@@ -1615,12 +1630,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        # 去掉 BASE_PATH 前缀，使后续路由匹配无需修改
+        if BASE_PATH and path.startswith(BASE_PATH):
+            path = path[len(BASE_PATH):] or '/'
         session = self.get_session()
 
         if path in ('/', '/login'):
             if session:
                 self.send_response(302)
-                self.send_header('Location', '/dashboard')
+                self.send_header('Location', f'{BASE_PATH}/dashboard')
                 self.end_headers()
             else:
                 self.render_login('', '')
@@ -1628,7 +1646,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/register':
             if session:
                 self.send_response(302)
-                self.send_header('Location', '/dashboard')
+                self.send_header('Location', f'{BASE_PATH}/dashboard')
                 self.end_headers()
             else:
                 self.render_register('', '')
@@ -1636,7 +1654,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == '/dashboard':
             if not session:
                 self.send_response(302)
-                self.send_header('Location', '/login')
+                self.send_header('Location', f'{BASE_PATH}/login')
                 self.end_headers()
             else:
                 self.render_dashboard(session)
@@ -1645,11 +1663,11 @@ class Handler(BaseHTTPRequestHandler):
             # 模型管理页面（仅admin）
             if not session:
                 self.send_response(302)
-                self.send_header('Location', '/login')
+                self.send_header('Location', f'{BASE_PATH}/login')
                 self.end_headers()
             elif session.get('role') != 'admin':
                 self.send_response(403)
-                self.send_html('<h1>Forbidden</h1><p>只有管理员可以访问模型管理。</p><a href="/dashboard">返回</a>')
+                self.send_html(f'<h1>Forbidden</h1><p>只有管理员可以访问模型管理。</p><a href="{BASE_PATH}/dashboard">返回</a>')
             else:
                 self.render_models_page(session)
 
@@ -1660,17 +1678,17 @@ class Handler(BaseHTTPRequestHandler):
                     sid = part.split('=')[1].strip()
                     sessions.pop(sid, None)
             self.send_response(302)
-            self.send_header('Location', '/login')
+            self.send_header('Location', f'{BASE_PATH}/login')
             self.end_headers()
 
         elif path == '/delete':
             if not session:
                 self.send_response(302)
-                self.send_header('Location', '/login')
+                self.send_header('Location', f'{BASE_PATH}/login')
                 self.end_headers()
             elif session.get('role') != 'admin':
                 self.send_response(403)
-                self.send_html('<h1>Forbidden</h1><p>Viewer cannot delete servers.</p><a href="/dashboard">Back</a>')
+                self.send_html(f'<h1>Forbidden</h1><p>Viewer cannot delete servers.</p><a href="{BASE_PATH}/dashboard">Back</a>')
             else:
                 query = urllib.parse.parse_qs(parsed.query)
                 if 'id' in query:
@@ -1679,17 +1697,17 @@ class Handler(BaseHTTPRequestHandler):
                     data['servers'] = [s for s in data['servers'] if s['id'] != sid]
                     save_data(data)
                 self.send_response(302)
-                self.send_header('Location', '/dashboard')
+                self.send_header('Location', f'{BASE_PATH}/dashboard')
                 self.end_headers()
         
         elif path == '/edit':
             if not session:
                 self.send_response(302)
-                self.send_header('Location', '/login')
+                self.send_header('Location', f'{BASE_PATH}/login')
                 self.end_headers()
             elif session.get('role') != 'admin':
                 self.send_response(403)
-                self.send_html('<h1>Forbidden</h1><p>Viewer cannot edit servers.</p><a href="/dashboard">Back</a>')
+                self.send_html(f'<h1>Forbidden</h1><p>Viewer cannot edit servers.</p><a href="{BASE_PATH}/dashboard">Back</a>')
             else:
                 query = urllib.parse.parse_qs(parsed.query)
                 if 'id' in query:
@@ -1697,7 +1715,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.render_edit_form(sid)
                 else:
                     self.send_response(302)
-                    self.send_header('Location', '/dashboard')
+                    self.send_header('Location', f'{BASE_PATH}/dashboard')
                     self.end_headers()
         
         elif path == '/api/node_info':
@@ -2088,6 +2106,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        # 去掉 BASE_PATH 前缀，使后续路由匹配无需修改
+        if BASE_PATH and path.startswith(BASE_PATH):
+            path = path[len(BASE_PATH):] or '/'
         session = self.get_session()
 
         length = int(self.headers.get('Content-Length', 0))
@@ -2103,8 +2124,8 @@ class Handler(BaseHTTPRequestHandler):
                 sid = str(uuid.uuid4())
                 sessions[sid] = {'username': user, 'role': users[user]['role']}
                 self.send_response(302)
-                self.send_header('Location', '/dashboard')
-                self.send_header('Set-Cookie', f'session={sid}; Path=/')
+                self.send_header('Location', f'{BASE_PATH}/dashboard')
+                self.send_header('Set-Cookie', f'session={sid}; Path={BASE_PATH}/')
                 self.end_headers()
             else:
                 self.render_login('<div class="error">用户名或密码错误</div>', '')
@@ -2128,11 +2149,11 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 if not session:
                     self.send_response(302)
-                    self.send_header('Location', '/login')
+                    self.send_header('Location', f'{BASE_PATH}/login')
                     self.end_headers()
                 elif session.get('role') != 'admin':
                     self.send_response(403)
-                    self.send_html('<h1>Forbidden</h1><p>Viewer cannot add servers.</p><a href="/dashboard">Back</a>')
+                    self.send_html(f'<h1>Forbidden</h1><p>Viewer cannot add servers.</p><a href="{BASE_PATH}/dashboard">Back</a>')
                 else:
                     gpus = []
                     for key in form:
@@ -2214,23 +2235,23 @@ class Handler(BaseHTTPRequestHandler):
                                 break
                     
                     self.send_response(302)
-                    self.send_header('Location', f'/dashboard{expand_param}')
+                    self.send_header('Location', f'{BASE_PATH}/dashboard{expand_param}')
                     self.end_headers()
             except Exception as e:
                 import traceback
                 print(f"Error adding server: {e}")
                 print(traceback.format_exc())
                 self.send_response(500)
-                self.send_html(f'<h1>Error</h1><p>{e}</p><a href="/dashboard">Back</a>')
+                self.send_html(f'<h1>Error</h1><p>{e}</p><a href="{BASE_PATH}/dashboard">Back</a>')
 
         elif path == '/batch_delete':
             if not session:
                 self.send_response(302)
-                self.send_header('Location', '/login')
+                self.send_header('Location', f'{BASE_PATH}/login')
                 self.end_headers()
             elif session.get('role') != 'admin':
                 self.send_response(403)
-                self.send_html('<h1>Forbidden</h1><p>Viewer cannot delete servers.</p><a href="/dashboard">Back</a>')
+                self.send_html(f'<h1>Forbidden</h1><p>Viewer cannot delete servers.</p><a href="{BASE_PATH}/dashboard">Back</a>')
             else:
                 ids = form.get('ids', [''])[0]
                 if ids:
@@ -2239,17 +2260,17 @@ class Handler(BaseHTTPRequestHandler):
                     data['servers'] = [s for s in data['servers'] if s['id'] not in id_list]
                     save_data(data)
                 self.send_response(302)
-                self.send_header('Location', '/dashboard')
+                self.send_header('Location', f'{BASE_PATH}/dashboard')
                 self.end_headers()
         
         elif path == '/update':
             if not session:
                 self.send_response(302)
-                self.send_header('Location', '/login')
+                self.send_header('Location', f'{BASE_PATH}/login')
                 self.end_headers()
             elif session.get('role') != 'admin':
                 self.send_response(403)
-                self.send_html('<h1>Forbidden</h1><p>Viewer cannot edit servers.</p><a href="/dashboard">Back</a>')
+                self.send_html(f'<h1>Forbidden</h1><p>Viewer cannot edit servers.</p><a href="{BASE_PATH}/dashboard">Back</a>')
             else:
                 try:
                     server_id = int(form.get('id', ['0'])[0])
@@ -2294,14 +2315,14 @@ class Handler(BaseHTTPRequestHandler):
                             break
                     save_data(data)
                     self.send_response(302)
-                    self.send_header('Location', '/dashboard')
+                    self.send_header('Location', f'{BASE_PATH}/dashboard')
                     self.end_headers()
                 except Exception as e:
                     import traceback
                     print(f"Error updating server: {e}")
                     print(traceback.format_exc())
                     self.send_response(500)
-                    self.send_html(f'<h1>Error</h1><p>{e}</p><a href="/dashboard">Back</a>')
+                    self.send_html(f'<h1>Error</h1><p>{e}</p><a href="{BASE_PATH}/dashboard">Back</a>')
 
         # 模型管理API（使用JSON格式）
         elif path == '/api/models/add':
@@ -2517,7 +2538,7 @@ class Handler(BaseHTTPRequestHandler):
         <h1>服务器智能管理系统</h1>
         <p class="login-subtitle">Server Intelligent Management System</p>
         {msg}
-        <form method="POST" action="/login">
+        <form method="POST" action="{BASE_PATH}/login">
             <div class="login-form-group">
                 <label>用户名</label>
                 <input type="text" name="username" placeholder="请输入用户名" required autofocus>
@@ -2529,7 +2550,7 @@ class Handler(BaseHTTPRequestHandler):
             <button type="submit" class="btn-login">登 录</button>
         </form>
         <div class="switch-mode">
-            还没有账号？<a href="/register">立即注册</a>
+            还没有账号？<a href="{BASE_PATH}/register">立即注册</a>
         </div>
     </div>
 </body>
@@ -2550,7 +2571,7 @@ class Handler(BaseHTTPRequestHandler):
         <h1>用户注册</h1>
         <p class="login-subtitle">Create New Account</p>
         {msg}
-        <form method="POST" action="/register">
+        <form method="POST" action="{BASE_PATH}/register">
             <div class="login-form-group">
                 <label>用户名</label>
                 <input type="text" name="username" placeholder="请输入用户名" required autofocus>
@@ -2569,7 +2590,7 @@ class Handler(BaseHTTPRequestHandler):
             <button type="submit" class="btn-login">注 册</button>
         </form>
         <div class="switch-mode">
-            已有账号？<a href="/login">立即登录</a>
+            已有账号？<a href="{BASE_PATH}/login">立即登录</a>
         </div>
     </div>
 </body>
@@ -2819,7 +2840,7 @@ class Handler(BaseHTTPRequestHandler):
                     <h2>添加物理机</h2>
                     <button class="btn-close" onclick="closeModal()">&times;</button>
                 </div>
-                <form method="POST" action="/add" id="addForm">
+                <form method="POST" action="{BASE_PATH}/add" id="addForm">
                     <input type="hidden" name="type" value="physical">
                     <input type="hidden" name="reg_type" value="auto">
                     <input type="hidden" name="ssh_verified" value="true">
@@ -2895,7 +2916,7 @@ class Handler(BaseHTTPRequestHandler):
                     <h2>手动注册物理机</h2>
                     <button class="btn-close" onclick="closeManualAddModal()">&times;</button>
                 </div>
-                <form method="POST" action="/add" id="manualAddForm">
+                <form method="POST" action="{BASE_PATH}/add" id="manualAddForm">
                     <input type="hidden" name="type" value="physical">
                     <input type="hidden" name="reg_type" value="manual">
                     <input type="hidden" name="ssh_verified" id="manualSshVerified" value="false">
@@ -3008,7 +3029,7 @@ class Handler(BaseHTTPRequestHandler):
                     <h2>添加虚拟机</h2>
                     <button class="btn-close" onclick="closeAddVmModal()">&times;</button>
                 </div>
-                <form method="POST" action="/add" id="addVmForm">
+                <form method="POST" action="{BASE_PATH}/add" id="addVmForm">
                     <input type="hidden" name="type" value="virtual">
                     <input type="hidden" name="reg_type" value="auto">
                     <input type="hidden" name="ssh_verified" value="true">
@@ -3092,7 +3113,7 @@ class Handler(BaseHTTPRequestHandler):
                     <h2>手动添加虚拟机</h2>
                     <button class="btn-close" onclick="closeManualAddVmModal()">&times;</button>
                 </div>
-                <form method="POST" action="/add" id="manualAddVmForm">
+                <form method="POST" action="{BASE_PATH}/add" id="manualAddVmForm">
                     <input type="hidden" name="type" value="virtual">
                     <input type="hidden" name="parent_host" id="manualVmParentHost" value="">
                     <input type="hidden" name="ssh_verified" id="manualVmSshVerified" value="false">
@@ -3199,8 +3220,8 @@ class Handler(BaseHTTPRequestHandler):
                 <span>▼</span>
             </div>
             <div class="user-menu-dropdown" id="userMenuDropdown">
-                {f'<a href="/models" class="user-menu-item admin-only">模型管理</a>' if session.get('role') == 'admin' else ''}
-                <a href="/logout" class="user-menu-item">退出登录</a>
+                {f'<a href="{BASE_PATH}/models" class="user-menu-item admin-only">模型管理</a>' if session.get('role') == 'admin' else ''}
+                <a href="{BASE_PATH}/logout" class="user-menu-item">退出登录</a>
             </div>
         </div>
     </div>
@@ -3310,6 +3331,7 @@ class Handler(BaseHTTPRequestHandler):
     </div>
     {add_modal_html if is_admin else ''}
     <script>
+        const BASE_PATH = '{BASE_PATH}';
         let selectedIds = [];
         
         // Admin 特有的弹窗函数
@@ -3378,7 +3400,7 @@ class Handler(BaseHTTPRequestHandler):
             }}
             
             try {{
-                const response = await fetch('/api/node_info?node=' + encodeURIComponent(nodeName));
+                const response = await fetch(BASE_PATH + '/api/node_info?node=' + encodeURIComponent(nodeName));
                 const data = await response.json();
                 
                 if (data.success) {{
@@ -3565,7 +3587,7 @@ class Handler(BaseHTTPRequestHandler):
             
             const form = document.createElement('form');
             form.method = 'POST';
-            form.action = '/batch_delete';
+            form.action = BASE_PATH + '/batch_delete';
             const input = document.createElement('input');
             input.type = 'hidden';
             input.name = 'ids';
@@ -3581,7 +3603,7 @@ class Handler(BaseHTTPRequestHandler):
                 alert('请只选择一台服务器进行修改');
                 return;
             }}
-            window.location.href = '/edit?id=' + selectedIds[0];
+            window.location.href = BASE_PATH + '/edit?id=' + selectedIds[0];
         }}
         
         // 折叠/展开虚拟机列表
@@ -3727,7 +3749,7 @@ class Handler(BaseHTTPRequestHandler):
         // 获取虚拟机列表
         async function fetchVmList(nodeName) {{
             try {{
-                const response = await fetch('/api/vm_list?node=' + encodeURIComponent(nodeName));
+                const response = await fetch(BASE_PATH + '/api/vm_list?node=' + encodeURIComponent(nodeName));
                 const data = await response.json();
                 
                 if (data.success) {{
@@ -3794,7 +3816,7 @@ class Handler(BaseHTTPRequestHandler):
             
             // 获取虚拟机详细信息
             try {{
-                const response = await fetch('/api/vm_info?node=' + encodeURIComponent(currentNodeName) + 
+                const response = await fetch(BASE_PATH + '/api/vm_info?node=' + encodeURIComponent(currentNodeName) + 
                     '&vmid=' + encodeURIComponent(vmInfo.vmid) + 
                     '&type=' + encodeURIComponent(vmInfo.type));
                 const data = await response.json();
@@ -3869,7 +3891,7 @@ class Handler(BaseHTTPRequestHandler):
             
             // 获取物理机GPU信息并生成选择框
             try {{
-                const response = await fetch('/api/host_gpu_info?hostname=' + encodeURIComponent(parentHost));
+                const response = await fetch(BASE_PATH + '/api/host_gpu_info?hostname=' + encodeURIComponent(parentHost));
                 const data = await response.json();
                 const vmGpuSelection = document.getElementById('vmGpuSelection');
                 const vmGpuCount = document.getElementById('vmGpuCount');
@@ -3929,7 +3951,7 @@ class Handler(BaseHTTPRequestHandler):
             
             // 获取物理机GPU信息并生成选择框
             try {{
-                const response = await fetch('/api/host_gpu_info?hostname=' + encodeURIComponent(hostname));
+                const response = await fetch(BASE_PATH + '/api/host_gpu_info?hostname=' + encodeURIComponent(hostname));
                 const data = await response.json();
                 const manualVmGpuSelection = document.getElementById('manualVmGpuSelection');
                 const manualVmGpuCount = document.getElementById('manualVmGpuCount');
@@ -4007,7 +4029,7 @@ class Handler(BaseHTTPRequestHandler):
             verifyBtn.textContent = '验证中...';
             
             try {{
-                const response = await fetch('/api/verify_ssh?ip=' + encodeURIComponent(ip) + 
+                const response = await fetch(BASE_PATH + '/api/verify_ssh?ip=' + encodeURIComponent(ip) + 
                     '&username=' + encodeURIComponent(username) + 
                     '&password=' + encodeURIComponent(password));
                 const data = await response.json();
@@ -4070,7 +4092,7 @@ class Handler(BaseHTTPRequestHandler):
             verifyBtn.textContent = '验证中...';
             
             try {{
-                const response = await fetch('/api/verify_ssh?ip=' + encodeURIComponent(ip) + 
+                const response = await fetch(BASE_PATH + '/api/verify_ssh?ip=' + encodeURIComponent(ip) + 
                     '&username=' + encodeURIComponent(username) + 
                     '&password=' + encodeURIComponent(password));
                 const data = await response.json();
@@ -4195,7 +4217,7 @@ class Handler(BaseHTTPRequestHandler):
         // 预加载日志（后台获取）
         async function preloadLogs(serverId) {{
             try {{
-                const response = await fetch('/api/server_logs?id=' + serverId);
+                const response = await fetch(BASE_PATH + '/api/server_logs?id=' + serverId);
                 const data = await response.json();
                 if (data.success) {{
                     logsCache[serverId] = {{
@@ -4244,7 +4266,7 @@ class Handler(BaseHTTPRequestHandler):
             document.getElementById('diskValue').textContent = '-- MB/s';
             
             try {{
-                const response = await fetch('/api/performance?id=' + serverId);
+                const response = await fetch(BASE_PATH + '/api/performance?id=' + serverId);
                 const data = await response.json();
                 
                 if (data.success) {{
@@ -4330,7 +4352,7 @@ class Handler(BaseHTTPRequestHandler):
             
             try {{
                 // 调用 AI 诊断 API（流式响应）
-                const response = await fetch('/api/ai_diagnosis?id=' + currentPerfServerId);
+                const response = await fetch(BASE_PATH + '/api/ai_diagnosis?id=' + currentPerfServerId);
                 
                 if (!response.ok) {{
                     content.innerHTML = '<span style="color:#f44336;">获取诊断失败：' + response.statusText + '</span>';
@@ -4450,13 +4472,13 @@ class Handler(BaseHTTPRequestHandler):
                 <span>▲</span>
             </div>
             <div class="user-menu-dropdown" id="userMenuDropdown">
-                <a href="/models" class="user-menu-item admin-only">模型管理</a>
-                <a href="/logout" class="user-menu-item">退出登录</a>
+                <a href="{BASE_PATH}/models" class="user-menu-item admin-only">模型管理</a>
+                <a href="{BASE_PATH}/logout" class="user-menu-item">退出登录</a>
             </div>
         </div>
     </div>
     <div class="models-container">
-        <a href="/dashboard" class="back-link">← 返回控制台</a>
+        <a href="{BASE_PATH}/dashboard" class="back-link">← 返回控制台</a>
         <div class="models-header">
             <h2>模型管理</h2>
         </div>
@@ -4512,6 +4534,7 @@ class Handler(BaseHTTPRequestHandler):
     </div>
     
     <script>
+        const BASE_PATH = '{BASE_PATH}';
         // 用户菜单切换
         function toggleUserMenu() {{
             const dropdown = document.getElementById('userMenuDropdown');
@@ -4541,7 +4564,7 @@ class Handler(BaseHTTPRequestHandler):
         // 选择模型
         async function selectModel(modelId) {{
             try {{
-                const response = await fetch('/api/models/select', {{
+                const response = await fetch(BASE_PATH + '/api/models/select', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{model_id: modelId}})
@@ -4570,7 +4593,7 @@ class Handler(BaseHTTPRequestHandler):
             const timeoutId = setTimeout(() => controller.abort(), 15000); // 15秒超时
             
             try {{
-                const response = await fetch('/api/models/test', {{
+                const response = await fetch(BASE_PATH + '/api/models/test', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{model_id: modelId}}),
@@ -4607,7 +4630,7 @@ class Handler(BaseHTTPRequestHandler):
             if (!confirm('确定要删除此模型吗？')) return;
             
             try {{
-                const response = await fetch('/api/models/delete', {{
+                const response = await fetch(BASE_PATH + '/api/models/delete', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{model_id: modelId}})
@@ -4665,7 +4688,7 @@ class Handler(BaseHTTPRequestHandler):
             }}
             
             try {{
-                const response = await fetch('/api/models/add', {{
+                const response = await fetch(BASE_PATH + '/api/models/add', {{
                     method: 'POST',
                     headers: {{'Content-Type': 'application/json'}},
                     body: JSON.stringify({{
@@ -4705,7 +4728,7 @@ class Handler(BaseHTTPRequestHandler):
         
         if not server:
             self.send_response(302)
-            self.send_header('Location', '/dashboard')
+            self.send_header('Location', f'{BASE_PATH}/dashboard')
             self.end_headers()
             return
         
@@ -4772,11 +4795,11 @@ class Handler(BaseHTTPRequestHandler):
 <body>
     <div class="header">
         <h1>修改服务器信息</h1>
-        <a href="/dashboard" style="color:white;text-decoration:none;background:rgba(255,255,255,0.2);padding:10px 20px;border-radius:8px;">返回列表</a>
+        <a href="{BASE_PATH}/dashboard" style="color:white;text-decoration:none;background:rgba(255,255,255,0.2);padding:10px 20px;border-radius:8px;">返回列表</a>
     </div>
     <div class="container">
         <div class="table-container" style="padding: 30px; max-width: 800px; margin: 0 auto;">
-            <form method="POST" action="/update">
+            <form method="POST" action="{BASE_PATH}/update">
                 <input type="hidden" name="id" value="{server['id']}">
                 <div class="form-row">
                     <div class="form-group">
@@ -4846,7 +4869,7 @@ class Handler(BaseHTTPRequestHandler):
                     <input type="text" name="user" value="{server['user']}" required>
                 </div>
                 <div style="display:flex;justify-content:flex-end;gap:15px;margin-top:30px;">
-                    <a href="/dashboard" class="btn-cancel" style="text-decoration:none;display:inline-block;text-align:center;">取消</a>
+                    <a href="{BASE_PATH}/dashboard" class="btn-cancel" style="text-decoration:none;display:inline-block;text-align:center;">取消</a>
                     <button type="submit" class="btn-save">保存修改</button>
                 </div>
             </form>
@@ -4869,7 +4892,7 @@ if __name__ == '__main__':
         save_users({'admin': {'password': '123456', 'role': 'admin'}})
     
     # 从环境变量读取配置，支持内网部署自定义
-    port = int(os.environ.get('PORT', '8080'))
+    port = int(os.environ.get('PORT', '5001'))
     host = os.environ.get('HOST', '0.0.0.0')  # 默认绑定所有接口，支持内网访问
     
     print('=' * 50)
